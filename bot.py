@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime
 
-# --- CONFIGURATION (Loaded securely from GitHub) ---
+# --- CONFIGURATION ---
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -18,14 +18,18 @@ def get_fresh_pools():
     fresh_pools = []
     now = time.time() * 1000
     
-    for pool in response.get("data", [])[:10]: # Check top 10 newest
+    for pool in response.get("data", [])[:10]:
         attrs = pool.get("attributes", {})
         rel = pool.get("relationships", {})
         
         # Calculate age
-        created_at = datetime.fromisoformat(attrs.get("pool_created_at", "1970-01-01T00:00:00Z").replace("Z", "+00:00")).timestamp() * 1000
+        created_at_str = attrs.get("pool_created_at", "1970-01-01T00:00:00Z")
+        created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).timestamp() * 1000
         age_minutes = (now - created_at) / 60000
-        liquidity = float(attrs.get("reserve_in_usd", 0))
+        
+        # FIX: Handle None values properly
+        liquidity_val = attrs.get("reserve_in_usd")
+        liquidity = float(liquidity_val) if liquidity_val is not None else 0.0
         
         token_address = rel.get("base_token", {}).get("data", {}).get("id", "").replace("base_", "")
         token_name = attrs.get("name", "").split("/")[0]
@@ -38,7 +42,7 @@ def get_fresh_pools():
                 "liquidity": liquidity,
                 "dex_url": f"https://dexscreener.com/base/{token_address}"
             })
-    return fresh_pools[:3] # Limit to top 3 to save API calls
+    return fresh_pools[:3]
 
 def get_first_buyers(token_address, pool_address):
     """Fetches the first 3 buyers of the token."""
@@ -56,25 +60,23 @@ def get_first_buyers(token_address, pool_address):
     buyers = []
     for t in response.get("result", {}).get("transfers", [])[:3]:
         buyer = t.get("to", "").lower()
-        # Filter out zero address and the pool contract itself
         if buyer and buyer != "0x0000000000000000000000000000000000000000" and buyer != pool_address.lower():
             buyers.append(buyer)
     return buyers
 
 def check_wallet_experience(wallet):
-    """Checks if a wallet is a 'Newbie' or 'Experienced' based on total ERC20 transfers."""
+    """Checks if a wallet is a 'Newbie' or 'Experienced'."""
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers",
         "params": [{
             "fromBlock": "0x0", "toBlock": "latest", "category": ["erc20"],
-            "fromAddress": wallet, "maxCount": "0x1" # Just check if they have history
+            "fromAddress": wallet, "maxCount": "0x1"
         }]
     }
     url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
     response = requests.post(url, json=payload).json()
     transfers = response.get("result", {}).get("transfers", [])
     
-    # If they have more than 5 historical ERC20 transfers, they are "Known"
     is_known = len(transfers) > 0 
     return is_known
 
@@ -104,7 +106,7 @@ def main():
             is_known = check_wallet_experience(buyer)
             
             if is_known:
-                emoji, status = "⚠️", "Known Insider Detected"
+                emoji, status = "️", "Known Insider Detected"
             else:
                 emoji, status = "🆕", "New Insider Detected"
             
@@ -118,7 +120,7 @@ def main():
             
             print(f"📤 Sending alert for {buyer}...")
             send_alert(message)
-            time.sleep(1.5) # Prevent Telegram spam limits
+            time.sleep(1.5)
 
     print("✅ Scan complete.")
 
