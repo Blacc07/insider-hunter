@@ -4,10 +4,12 @@ Runs every 2 min on GitHub Actions (Base network).
 Watches Uniswap V3 + Aerodrome factories for new pools,
 extracts first buyers, stores everything in SQLite.
 
-FIX in this version:
-- Alchemy FREE TIER allows max 10 blocks per eth_getLogs query on Base.
-  We now slice the scan window into <=10-block chunks (hard-capped).
-- 4xx client errors are NOT retried (deterministic); body is logged.
+v3 CHANGES (cron-gap insurance):
+- SCAN_BLOCK_WINDOW widened 100 -> 200 blocks (~6.7 min) so GitHub cron
+  jitter/delays cannot blind the hunter.
+- MAX_SLICES_PER_FACTORY raised 12 -> 22 (21 slices needed for 201 blocks).
+- REQUEST_DELAY_SEC tightened 1.5 -> 1.0 to keep runtime under the cron
+  interval despite the extra slices (still polite to the free tier).
 Indentation: 4 spaces ONLY.
 """
 
@@ -30,14 +32,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 DB_PATH = os.environ.get("DB_PATH", "insider_hunter.db")
 
-SCAN_BLOCK_WINDOW = 100          # ~3 min of Base blocks + cron-jitter overlap
+SCAN_BLOCK_WINDOW = 200          # ~6.7 min of Base blocks + cron-jitter overlap
 FREE_TIER_LOG_RANGE = 10         # Alchemy free tier: max blocks per eth_getLogs query (Base)
-MAX_SLICES_PER_FACTORY = 12      # hard cap: 12 slices x 10 blocks = 120 blocks max per factory/run
+MAX_SLICES_PER_FACTORY = 22      # hard cap: 22 slices x 10 blocks = 220 blocks max per factory/run
 MAX_PAGES = 5                    # hard pagination cap (free tier rule)
 MAX_POOLS_PER_RUN = 5            # hard cap on pools processed per run
 MAX_BUYERS_PER_POOL = 10         # hard cap on first buyers stored per pool
 MAX_TRANSFERS_PER_PAGE = 1000    # Alchemy max per page
-REQUEST_DELAY_SEC = 1.5          # polite delay between Alchemy calls
+REQUEST_DELAY_SEC = 1.0          # polite delay between Alchemy calls
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -258,7 +260,7 @@ def get_latest_block():
 # ---------------------------------------------------------------------------
 # 🔎 DISCOVERY (10-block slices = free-tier legal)
 # ---------------------------------------------------------------------------
-def build_slices(from_block: int, to_block: int) -> list:
+def build_slices(from_block: int, to_block: int) -> tuple:
     """Split [from_block, to_block] into <=FREE_TIER_LOG_RANGE chunks, capped."""
     slices = []
     start = from_block
