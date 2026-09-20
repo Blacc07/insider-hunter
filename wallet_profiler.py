@@ -59,8 +59,8 @@ def analyze_wallet(wallet_address):
     if not transfers:
         return {"wallet": wallet_address, "verdict": "👶 NEWBIE (No History)", "score": 0}
 
-    # Track activity per token
-    token_activity = defaultdict({"buys": 0, "sells": 0})
+    # Track activity per token - FIXED: Use lambda for defaultdict
+    token_activity = defaultdict(lambda: {"buys": 0, "sells": 0})
     
     for tx in transfers:
         token = tx.get("rawContract", {}).get("address", "").lower()
@@ -93,10 +93,10 @@ def analyze_wallet(wallet_address):
         verdict = "🚩 BAG HOLDER (Buys but never sells)"
         score = 20
     elif total_buys < 5 and total_sells < 2:
-        verdict = "👶 NEWBIE (Too little data)"
+        verdict = " NEWBIE (Too little data)"
         score = 0
     else:
-        verdict = "️ AVERAGE"
+        verdict = "⚠️ AVERAGE"
         score = 50
 
     return {
