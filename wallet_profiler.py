@@ -9,14 +9,15 @@ ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# The 6 wallets you found (replace with actual addresses)
+# The 7 wallets you found (replace with actual addresses)
 WALLETS_TO_ANALYZE = [
-    "0x...",  # Wallet 1
-    "0x...",  # Wallet 2
-    "0x...",  # Wallet 3
-    "0x...",  # Wallet 4
-    "0x...",  # Wallet 5
-    "0x...",  # Wallet 6
+    "0xbe6d8853ce2c4d14e2d904681760e329a8283869",  # Wallet 1
+    "0x6aa989249e423b0f843a2b10cab9ea7eca41c7e8",  # Wallet 2
+    "0xe09512e2d80abe8f6249a742f07e84b1b68f9b11",  # Wallet 3
+    "0x6aa989249e423b0f843a2b10cab9ea7eca41c7e8",  # Wallet 4
+    "0x9f54942b5ac21255b54469528857cbff4cf7f027",  # Wallet 5
+    "0x498581ff718922c3f8e6a244956af099b2652b2b",  # Wallet 6
+    "0x4d1b821a43fba502c4ea72fd78d2cd04bb97e9f9",  # Wallet 7
 ]
 
 def get_wallet_transactions(wallet_address):
