@@ -1,8 +1,9 @@
 """
 🕵️ Insider Hunter — Phase 1: Discovery (bot.py)
 Runs every 2 min on GitHub Actions (Base network).
-Finds new Uniswap V3 pools, extracts first buyers, stores them in SQLite.
-Indentation: 4 spaces ONLY (fixes IndentationError at old line 65).
+Watches Uniswap V3 + Aerodrome factories for new pools,
+extracts first buyers, stores everything in SQLite.
+Indentation: 4 spaces ONLY.
 """
 
 import os
@@ -11,6 +12,7 @@ import time
 import sqlite3
 import requests
 from datetime import datetime, timezone
+from Crypto.Hash import keccak
 
 # ---------------------------------------------------------------------------
 # ⚙️ CONFIGURATION (free-tier safe tunables)
@@ -23,10 +25,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 DB_PATH = os.environ.get("DB_PATH", "insider_hunter.db")
 
-# Uniswap V3 Factory on Base + PoolCreated event topic0
-FACTORY_ADDRESS = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
-POOL_CREATED_TOPIC = "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
-
 SCAN_BLOCK_WINDOW = 100         # ~2 min of Base blocks (2s blocks) + overlap
 MAX_PAGES = 5                   # hard pagination cap (free tier rule)
 MAX_POOLS_PER_RUN = 5           # hard cap on pools processed per run
@@ -36,11 +34,29 @@ REQUEST_DELAY_SEC = 1.5         # polite delay between Alchemy calls
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-# Quote tokens on Base (the "non-insider" side of a pair)
+# Canonical factory deployments on Base.
+# pool_word_index = which 32-byte word of event `data` holds the pool address.
+FACTORIES = {
+    "uniswap_v3": {
+        "label": "Uniswap V3",
+        "address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+        "signature": "PoolCreated(address,address,uint24,int24,address)",
+        "pool_word_index": 1,
+    },
+    "aerodrome": {
+        "label": "Aerodrome",
+        "address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
+        "signature": "PoolCreated(address,address,bool,address,uint256)",
+        "pool_word_index": 0,
+    },
+}
+
+# Quote tokens on Base (the "non-insider" side of a pair), lowercase
 QUOTE_TOKENS = {
     "0x4200000000000000000000000000000000000006",  # WETH
     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
     "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
 }
 
 
@@ -54,6 +70,23 @@ def short(addr: str) -> str:
     return f"{addr[:6]}...{addr[-4:]}" if len(addr) >= 10 else addr
 
 
+def event_topic(signature: str) -> str:
+    """Compute topic0 = keccak256(event signature). No hardcoded hashes."""
+    digest = keccak.new(digest_bits=256)
+    digest.update(signature.encode("utf-8"))
+    return "0x" + digest.hexdigest()
+
+
+def prepare_factories() -> list:
+    prepared = []
+    for key, cfg in FACTORIES.items():
+        entry = dict(cfg)
+        entry["key"] = key
+        entry["topic0"] = event_topic(cfg.get("signature", ""))
+        prepared.append(entry)
+    return prepared
+
+
 # ---------------------------------------------------------------------------
 # 🗄️ SQLITE
 # ---------------------------------------------------------------------------
@@ -63,6 +96,7 @@ def init_db() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS pools (
             pool_address  TEXT PRIMARY KEY,
+            factory       TEXT DEFAULT '',
             token0        TEXT,
             token1        TEXT,
             target_token  TEXT,
@@ -87,7 +121,17 @@ def init_db() -> sqlite3.Connection:
         """
     )
     conn.commit()
+    ensure_column(conn, "pools", "factory", "TEXT DEFAULT ''")
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    """Safe migration for older DB files: add column only if missing."""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cur.fetchall()]
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.commit()
 
 
 def is_known_pool(conn: sqlite3.Connection, pool_address: str) -> bool:
@@ -97,13 +141,14 @@ def is_known_pool(conn: sqlite3.Connection, pool_address: str) -> bool:
     return cur.fetchone() is not None
 
 
-def record_pool(conn, pool_address, token0, token1, target_token, created_block) -> None:
+def record_pool(conn, pool_address, factory_label, token0, token1, target_token, created_block) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO pools "
-        "(pool_address, token0, token1, target_token, created_block, scanned_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(pool_address, factory, token0, token1, target_token, created_block, scanned_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             pool_address,
+            factory_label or "",
             token0 or "",
             token1 or "",
             target_token or "",
@@ -183,30 +228,30 @@ def get_latest_block():
 # ---------------------------------------------------------------------------
 # 🔎 DISCOVERY
 # ---------------------------------------------------------------------------
-def get_new_pools(from_block: int, to_block: int) -> list:
+def get_new_pools(factory: dict, from_block: int, to_block: int) -> list:
     logs = alchemy_call(
         "eth_getLogs",
         [
             {
                 "fromBlock": hex(from_block),
                 "toBlock": hex(to_block),
-                "address": FACTORY_ADDRESS,
-                "topics": [POOL_CREATED_TOPIC],
+                "address": factory.get("address", ""),
+                "topics": [factory.get("topic0", "")],
             }
         ],
     )
     pools = []
     if not logs or not isinstance(logs, list):
         return pools
+    word_index = factory.get("pool_word_index", 0)
     for entry in logs:
         if not isinstance(entry, dict):
             continue
         topics = entry.get("topics") or []
-        data = entry.get("data") or "0x"
+        data_hex = (entry.get("data") or "0x")[2:]
         block_hex = entry.get("blockNumber") or "0x0"
-        # PoolCreated(address idx token0, address idx token1, uint24 idx fee,
-        #             int24 tickSpacing, address pool) -> data = 2 words
-        if len(topics) < 3 or len(data) < 130:
+        words = [data_hex[i:i + 64] for i in range(0, len(data_hex), 64)]
+        if len(topics) < 3 or len(words) <= word_index:
             continue
         try:
             created_block = int(block_hex, 16)
@@ -214,9 +259,10 @@ def get_new_pools(from_block: int, to_block: int) -> list:
             created_block = 0
         pools.append(
             {
-                "token0": "0x" + topics[1][-40:],
-                "token1": "0x" + topics[2][-40:],
-                "pool": "0x" + data[-40:],
+                "factory": factory.get("label", "unknown"),
+                "pool": ("0x" + words[word_index][-40:]).lower(),
+                "token0": ("0x" + topics[1][-40:]).lower(),
+                "token1": ("0x" + topics[2][-40:]).lower(),
                 "created_block": created_block,
             }
         )
@@ -240,8 +286,6 @@ def get_first_buyers(pool_address: str, target_token: str, created_block: int) -
     Heuristic: a BUY = ERC-20 transfer FROM the pool TO a wallet
     (the pool pays out the token when someone swaps into it).
     Pages ascending, capped at MAX_PAGES and MAX_BUYERS_PER_POOL.
-    NOTE: the `return buyers` below is indented exactly 4 spaces —
-    this is the line that was broken (old line 65).
     """
     buyers = []
     seen = set()
@@ -304,7 +348,7 @@ def get_first_buyers(pool_address: str, target_token: str, created_block: int) -
 
 
 # ---------------------------------------------------------------------------
-#  TELEGRAM (optional, non-fatal)
+# 📣 TELEGRAM (optional, non-fatal)
 # ---------------------------------------------------------------------------
 def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -338,13 +382,18 @@ def main() -> None:
         sys.exit(0)
 
     from_block = max(0, latest_block - SCAN_BLOCK_WINDOW)
-    pools = get_new_pools(from_block, latest_block)
-    log(f"🔎 Blocks {from_block}->{latest_block}: {len(pools)} PoolCreated event(s).")
+    factories = prepare_factories()
+
+    all_pools = []
+    for factory in factories:
+        found = get_new_pools(factory, from_block, latest_block)
+        log(f"🏭 {factory.get('label')}: {len(found)} PoolCreated event(s).")
+        all_pools.extend(found)
 
     processed = 0
     discovered = 0
 
-    for pool in pools:
+    for pool in all_pools:
         pool_address = (pool.get("pool") or "").lower()
         if not pool_address or is_known_pool(conn, pool_address):
             continue
@@ -353,20 +402,21 @@ def main() -> None:
             break
 
         processed += 1
+        factory_label = pool.get("factory", "unknown")
         token0 = (pool.get("token0") or "").lower()
         token1 = (pool.get("token1") or "").lower()
         created_block = pool.get("created_block", 0)
 
         target_token = pick_target_token(token0, token1)
         if not target_token:
-            log(f"⏭️ Pool {short(pool_address)} has no quote-token pair — skipping.")
-            record_pool(conn, pool_address, token0, token1, "", created_block)
+            log(f"⏭️ Pool {short(pool_address)} ({factory_label}) has no quote-token pair — skipping.")
+            record_pool(conn, pool_address, factory_label, token0, token1, "", created_block)
             continue
 
-        log(f"🆕 New pool {short(pool_address)} | target {short(target_token)} | block {created_block}")
+        log(f"🆕 New {factory_label} pool {short(pool_address)} | target {short(target_token)} | block {created_block}")
         buyers = get_first_buyers(pool_address, target_token, created_block)
         saved = save_buyers(conn, buyers, pool_address, target_token)
-        record_pool(conn, pool_address, token0, token1, target_token, created_block)
+        record_pool(conn, pool_address, factory_label, token0, token1, target_token, created_block)
         discovered += 1
         log(f"💾 Stored {saved} first-buyer(s) for {short(pool_address)}.")
 
@@ -375,7 +425,7 @@ def main() -> None:
                 f"  • <code>{(b.get('wallet') or '')}</code>" for b in buyers[:5]
             )
             send_telegram(
-                f"️ <b>New Base pool</b> <code>{pool_address}</code>\n"
+                f"🏭 <b>{factory_label}</b> | 🆕 <b>New Base pool</b> <code>{pool_address}</code>\n"
                 f"🎯 Target: <code>{target_token}</code>\n"
                 f"👛 First buyers:\n{lines}"
             )
