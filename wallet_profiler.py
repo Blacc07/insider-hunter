@@ -1,6 +1,7 @@
 import requests
 import os
 import time
+import json
 from datetime import datetime
 from collections import defaultdict
 
@@ -20,12 +21,19 @@ WALLETS_TO_ANALYZE = [
     "0x4d1b821a43fba502c4ea72fd78d2cd04bb97e9f9",  # Wallet 7
 ]
 
+
+MAX_TRANSACTIONS = 1000  # SAFETY LIMIT: Max transactions to analyze per wallet
+MAX_PAGES = 10  # SAFETY LIMIT: Max API pages to fetch
+
 def get_wallet_transactions(wallet_address):
-    """Fetches ALL ERC20 transfers for a wallet."""
+    """Fetches ERC20 transfers with SAFETY LIMITS."""
     all_transfers = []
     next_key = None
+    page_count = 0
     
-    while True:
+    print(f"  📥 Fetching transactions for {wallet_address[:10]}...")
+    
+    while page_count < MAX_PAGES:
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -44,35 +52,60 @@ def get_wallet_transactions(wallet_address):
         if next_key:
             payload["params"][0]["pageKey"] = next_key
         
-        url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
-        response = requests.post(url, json=payload).json()
-        
-        transfers = response.get("result", {}).get("transfers", [])
-        all_transfers.extend(transfers)
-        
-        next_key = response.get("result", {}).get("pageKey")
-        if not next_key or len(transfers) < 100:
+        try:
+            url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+            response = requests.post(url, json=payload, timeout=30).json()
+            
+            transfers = response.get("result", {}).get("transfers", [])
+            all_transfers.extend(transfers)
+            
+            print(f"    Page {page_count + 1}: Found {len(transfers)} transactions (Total: {len(all_transfers)})")
+            
+            # SAFETY: Stop if we hit the transaction limit
+            if len(all_transfers) >= MAX_TRANSACTIONS:
+                print(f"  ️ Reached {MAX_TRANSACTIONS} transaction limit, stopping...")
+                break
+            
+            next_key = response.get("result", {}).get("pageKey")
+            if not next_key or len(transfers) == 0:
+                print(f"  ✅ No more pages to fetch")
+                break
+            
+            page_count += 1
+            time.sleep(0.3)  # Rate limiting
+            
+        except Exception as e:
+            print(f"  ❌ Error fetching page {page_count}: {e}")
             break
-        
-        time.sleep(0.5)  # Rate limiting
     
-    return all_transfers
+    return all_transfers[:MAX_TRANSACTIONS]
 
 def analyze_wallet(wallet_address):
     """Analyzes a wallet and returns detailed stats."""
     print(f"\n🔍 Analyzing {wallet_address}...")
     
-    transfers = get_wallet_transactions(wallet_address)
+    try:
+        transfers = get_wallet_transactions(wallet_address)
+    except Exception as e:
+        print(f"  ❌ Failed to fetch transactions: {e}")
+        return {
+            "wallet": wallet_address,
+            "total_trades": 0,
+            "status": f"Error: {str(e)}"
+        }
     
     if not transfers:
+        print(f"  ⚠️ No transactions found")
         return {
             "wallet": wallet_address,
             "total_trades": 0,
             "status": "No history found"
         }
     
+    print(f"  📊 Processing {len(transfers)} transactions...")
+    
     # Track buys and sells
-    token_positions = defaultdict(list)  # token -> list of (buy_time, buy_price, amount)
+    token_positions = defaultdict(list)
     completed_trades = []
     
     for tx in transfers:
@@ -82,18 +115,15 @@ def analyze_wallet(wallet_address):
         timestamp = tx.get("blockTimestamp", "")
         value = tx.get("value", 0)
         
-        # Determine if buy or sell
         if to_addr == wallet_address.lower():
-            # This is a BUY (tokens coming TO wallet)
             token_positions[token].append({
                 "type": "buy",
                 "time": timestamp,
                 "value": float(value) if value else 0
             })
         elif from_addr == wallet_address.lower():
-            # This is a SELL (tokens going FROM wallet)
             if token in token_positions and token_positions[token]:
-                buy_info = token_positions[token].pop(0)  # FIFO
+                buy_info = token_positions[token].pop(0)
                 completed_trades.append({
                     "token": token,
                     "buy_time": buy_info["time"],
@@ -112,12 +142,10 @@ def analyze_wallet(wallet_address):
             "status": "No completed trades"
         }
     
-    # Win/Loss analysis
     wins = 0
     losses = 0
     total_profit = 0
     total_hold_time = 0
-    profitable_trades = 0
     
     for trade in completed_trades:
         profit = trade["sell_value"] - trade["buy_value"]
@@ -125,11 +153,9 @@ def analyze_wallet(wallet_address):
         
         if profit > 0:
             wins += 1
-            profitable_trades += 1
         else:
             losses += 1
         
-        # Calculate hold time (simplified)
         try:
             buy_dt = datetime.fromisoformat(trade["buy_time"].replace("Z", "+00:00"))
             sell_dt = datetime.fromisoformat(trade["sell_time"].replace("Z", "+00:00"))
@@ -143,7 +169,6 @@ def analyze_wallet(wallet_address):
     avg_hold_minutes = (total_hold_time / total_trades / 60) if total_trades > 0 else 0
     profit_factor = (wins / losses) if losses > 0 else wins
     
-    # Determine wallet quality
     if win_rate >= 60 and avg_hold_minutes < 60 and profit_factor > 1.5:
         quality = "💎 GOLDMINE"
     elif win_rate >= 50:
@@ -171,7 +196,6 @@ def send_analysis_report(results):
     """Sends a detailed report to Telegram."""
     report = "📊 **WALLET PROFILER REPORT**\n\n"
     
-    # Sort by quality
     goldmines = [r for r in results if "GOLDMINE" in r.get("quality", "")]
     good = [r for r in results if "GOOD" in r.get("quality", "")]
     average = [r for r in results if "AVERAGE" in r.get("quality", "")]
@@ -190,12 +214,12 @@ def send_analysis_report(results):
             report += f"• `{r['wallet'][:10]}...` - {r['win_rate']}% WR\n"
     
     if average:
-        report += "\n️ **AVERAGE** (Monitor Only):\n"
+        report += "\n⚠️ **AVERAGE** (Monitor Only):\n"
         for r in average:
             report += f"• `{r['wallet'][:10]}...` - {r['win_rate']}% WR\n"
     
     if avoid:
-        report += "\n❌ **AVOID** (Low Quality):\n"
+        report += "\n **AVOID** (Low Quality):\n"
         for r in avoid:
             report += f"• `{r['wallet'][:10]}...` - {r['win_rate']}% WR\n"
     
@@ -210,20 +234,28 @@ def send_analysis_report(results):
 
 def main():
     print("🚀 Starting Wallet Profiler...")
+    print(f"⏱️  Safety limit: {MAX_TRANSACTIONS} transactions max per wallet\n")
+    
     results = []
     
-    for wallet in WALLETS_TO_ANALYZE:
+    for i, wallet in enumerate(WALLETS_TO_ANALYZE, 1):
+        print(f"\n{'='*60}")
+        print(f"Wallet {i}/{len(WALLETS_TO_ANALYZE)}")
+        print('='*60)
+        
         stats = analyze_wallet(wallet)
         results.append(stats)
-        print(f"✅ {stats['wallet'][:10]}... - {stats.get('quality', 'N/A')}")
-        time.sleep(2)  # Rate limiting
+        
+        print(f"\n✅ {stats['wallet'][:10]}... - {stats.get('quality', 'N/A')}")
+        print(f"   Trades: {stats.get('total_trades', 0)} | Win Rate: {stats.get('win_rate', 0)}%")
+        
+        time.sleep(1)  # Rate limiting between wallets
     
-    # Send report
+    print("\n" + "="*60)
+    print("📤 Sending report to Telegram...")
     send_analysis_report(results)
     
-    # Save to file for reference
     with open("wallet_analysis.json", "w") as f:
-        import json
         json.dump(results, f, indent=2)
     
     print("\n✅ Analysis complete! Check Telegram for report.")
