@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local environment variables
+.env
+
+# NOTE: insider_hunter.db is intentionally NOT ignored.
+# The workflow commits it back so the bot keeps its memory between runs.
