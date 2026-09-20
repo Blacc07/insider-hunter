@@ -60,7 +60,7 @@ def get_first_buyers(token_address, pool_address):
     buyers = []
     for t in response.get("result", {}).get("transfers", [])[:3]:
         buyer = t.get("to", "").lower()
-        if buyer and buyer != "0x0000000000000000000000000000000000000000" and buyer != pool_address.lower():
+if buyer and buyer != "0x0000000000000000000000000000000000000000" and buyer != "0x000000000000000000000000000000000000dead" and buyer != pool_address.lower():
             buyers.append(buyer)
     return buyers
 
