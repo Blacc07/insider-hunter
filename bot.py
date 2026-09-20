@@ -3,6 +3,11 @@
 Runs every 2 min on GitHub Actions (Base network).
 Watches Uniswap V3 + Aerodrome factories for new pools,
 extracts first buyers, stores everything in SQLite.
+
+FIX in this version:
+- Alchemy FREE TIER allows max 10 blocks per eth_getLogs query on Base.
+  We now slice the scan window into <=10-block chunks (hard-capped).
+- 4xx client errors are NOT retried (deterministic); body is logged.
 Indentation: 4 spaces ONLY.
 """
 
@@ -25,12 +30,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 DB_PATH = os.environ.get("DB_PATH", "insider_hunter.db")
 
-SCAN_BLOCK_WINDOW = 100         # ~2 min of Base blocks (2s blocks) + overlap
-MAX_PAGES = 5                   # hard pagination cap (free tier rule)
-MAX_POOLS_PER_RUN = 5           # hard cap on pools processed per run
-MAX_BUYERS_PER_POOL = 10        # hard cap on first buyers stored per pool
-MAX_TRANSFERS_PER_PAGE = 1000   # Alchemy max per page
-REQUEST_DELAY_SEC = 1.5         # polite delay between Alchemy calls
+SCAN_BLOCK_WINDOW = 100          # ~3 min of Base blocks + cron-jitter overlap
+FREE_TIER_LOG_RANGE = 10         # Alchemy free tier: max blocks per eth_getLogs query (Base)
+MAX_SLICES_PER_FACTORY = 12      # hard cap: 12 slices x 10 blocks = 120 blocks max per factory/run
+MAX_PAGES = 5                    # hard pagination cap (free tier rule)
+MAX_POOLS_PER_RUN = 5            # hard cap on pools processed per run
+MAX_BUYERS_PER_POOL = 10         # hard cap on first buyers stored per pool
+MAX_TRANSFERS_PER_PAGE = 1000    # Alchemy max per page
+REQUEST_DELAY_SEC = 1.5          # polite delay between Alchemy calls
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -186,32 +193,55 @@ def save_buyers(conn, buyers: list, pool_address: str, target_token: str) -> int
 
 
 # ---------------------------------------------------------------------------
-# 🌐 ALCHEMY (rate-limit + retry safe)
+# 🌐 ALCHEMY (free-tier safe: smart retries + exact error bodies)
 # ---------------------------------------------------------------------------
 def alchemy_call(method: str, params: list, retries: int = 3):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    for attempt in range(1, retries + 1):
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         try:
             resp = requests.post(ALCHEMY_URL, json=payload, timeout=30)
-            if resp.status_code == 429:
-                wait = 5 * attempt
-                log(f"⚠️ Alchemy 429 rate-limit. Sleeping {wait}s (attempt {attempt}/{retries}).")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, dict) or "error" in data:
-                err = (data.get("error") or {}) if isinstance(data, dict) else {}
-                log(f"⚠️ Alchemy RPC error: {err.get('message', 'unknown')}")
-                return None
-            time.sleep(REQUEST_DELAY_SEC)  # free-tier courtesy delay
-            return data.get("result")
         except requests.exceptions.RequestException as exc:
-            log(f"⚠️ Network error (attempt {attempt}/{retries}): {exc}")
-            time.sleep(3 * attempt)
+            log(f"⚠️ Network error on {method} (attempt {attempt}/{retries}): {exc}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+            continue
+
+        if resp.status_code == 429:
+            wait = 5 * attempt
+            log(f"⚠️ Alchemy 429 rate-limit on {method}. Sleeping {wait}s (attempt {attempt}/{retries}).")
+            time.sleep(wait)
+            continue
+
+        if 400 <= resp.status_code < 500:
+            # Deterministic client error (bad params/range): retrying is useless.
+            body = (resp.text or "")[:300].replace("\n", " ")
+            log(f"❌ Alchemy {resp.status_code} on {method} (client error, NOT retrying): {body}")
+            return None
+
+        if resp.status_code >= 500:
+            log(f"⚠️ Alchemy {resp.status_code} on {method} (server error, attempt {attempt}/{retries}).")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+            continue
+
+        # 2xx -> parse JSON-RPC envelope
+        try:
+            data = resp.json()
         except ValueError as exc:
-            log(f"⚠️ Bad JSON from Alchemy (attempt {attempt}/{retries}): {exc}")
-            time.sleep(3 * attempt)
+            log(f"⚠️ Bad JSON from Alchemy on {method} (attempt {attempt}/{retries}): {exc}")
+            if attempt < retries:
+                time.sleep(3 * attempt)
+            continue
+
+        if not isinstance(data, dict) or "error" in data:
+            err = (data.get("error") or {}) if isinstance(data, dict) else {}
+            log(f"⚠️ Alchemy RPC error on {method}: {err.get('message', 'unknown')}")
+            return None
+
+        time.sleep(REQUEST_DELAY_SEC)  # free-tier courtesy delay
+        return data.get("result")
     return None
 
 
@@ -226,46 +256,78 @@ def get_latest_block():
 
 
 # ---------------------------------------------------------------------------
-# 🔎 DISCOVERY
+# 🔎 DISCOVERY (10-block slices = free-tier legal)
 # ---------------------------------------------------------------------------
-def get_new_pools(factory: dict, from_block: int, to_block: int) -> list:
-    logs = alchemy_call(
-        "eth_getLogs",
-        [
-            {
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "address": factory.get("address", ""),
-                "topics": [factory.get("topic0", "")],
-            }
-        ],
-    )
-    pools = []
-    if not logs or not isinstance(logs, list):
-        return pools
+def build_slices(from_block: int, to_block: int) -> list:
+    """Split [from_block, to_block] into <=FREE_TIER_LOG_RANGE chunks, capped."""
+    slices = []
+    start = from_block
+    while start <= to_block and len(slices) < MAX_SLICES_PER_FACTORY:
+        end = min(start + FREE_TIER_LOG_RANGE - 1, to_block)
+        slices.append((start, end))
+        start = end + 1
+    return slices, start
+
+
+def parse_pool_created(factory: dict, entry: dict) -> dict:
+    """Null-safe parser for one PoolCreated log entry."""
+    if not isinstance(entry, dict):
+        return None
+    topics = entry.get("topics") or []
+    data_hex = (entry.get("data") or "0x")[2:]
+    block_hex = entry.get("blockNumber") or "0x0"
+    words = [data_hex[i:i + 64] for i in range(0, len(data_hex), 64)]
     word_index = factory.get("pool_word_index", 0)
-    for entry in logs:
-        if not isinstance(entry, dict):
-            continue
-        topics = entry.get("topics") or []
-        data_hex = (entry.get("data") or "0x")[2:]
-        block_hex = entry.get("blockNumber") or "0x0"
-        words = [data_hex[i:i + 64] for i in range(0, len(data_hex), 64)]
-        if len(topics) < 3 or len(words) <= word_index:
-            continue
-        try:
-            created_block = int(block_hex, 16)
-        except ValueError:
-            created_block = 0
-        pools.append(
-            {
-                "factory": factory.get("label", "unknown"),
-                "pool": ("0x" + words[word_index][-40:]).lower(),
-                "token0": ("0x" + topics[1][-40:]).lower(),
-                "token1": ("0x" + topics[2][-40:]).lower(),
-                "created_block": created_block,
-            }
+    if len(topics) < 3 or len(words) <= word_index:
+        return None
+    try:
+        created_block = int(block_hex, 16)
+    except ValueError:
+        created_block = 0
+    return {
+        "factory": factory.get("label", "unknown"),
+        "pool": ("0x" + words[word_index][-40:]).lower(),
+        "token0": ("0x" + topics[1][-40:]).lower(),
+        "token1": ("0x" + topics[2][-40:]).lower(),
+        "created_block": created_block,
+    }
+
+
+def get_new_pools(factory: dict, from_block: int, to_block: int) -> list:
+    slices, stopped_at = build_slices(from_block, to_block)
+    if stopped_at <= to_block:
+        log(
+            f"⛔ {factory.get('label')}: slice cap reached at block {stopped_at - 1}; "
+            f"remainder deferred to next run."
         )
+
+    pools = []
+    seen = set()
+    for (sb, eb) in slices:
+        logs = alchemy_call(
+            "eth_getLogs",
+            [
+                {
+                    "fromBlock": hex(sb),
+                    "toBlock": hex(eb),
+                    "address": factory.get("address", ""),
+                    "topics": [factory.get("topic0", "")],
+                }
+            ],
+        )
+        if logs is None:
+            log(f"⚠️ {factory.get('label')}: getLogs failed for blocks {sb}-{eb}; skipping slice.")
+            continue
+        if not isinstance(logs, list):
+            continue
+        for entry in logs:
+            parsed = parse_pool_created(factory, entry)
+            if not parsed:
+                continue
+            if parsed["pool"] in seen:
+                continue
+            seen.add(parsed["pool"])
+            pools.append(parsed)
     return pools
 
 
@@ -413,7 +475,10 @@ def main() -> None:
             record_pool(conn, pool_address, factory_label, token0, token1, "", created_block)
             continue
 
-        log(f"🆕 New {factory_label} pool {short(pool_address)} | target {short(target_token)} | block {created_block}")
+        log(
+            f"🆕 New {factory_label} pool {short(pool_address)} | "
+            f"target {short(target_token)} | block {created_block}"
+        )
         buyers = get_first_buyers(pool_address, target_token, created_block)
         saved = save_buyers(conn, buyers, pool_address, target_token)
         record_pool(conn, pool_address, factory_label, token0, token1, target_token, created_block)
