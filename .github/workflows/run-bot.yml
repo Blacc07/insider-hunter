@@ -37,6 +37,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python wallet_profiler.py
 
+      - name: Run sheets sync (Dashboard)
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python sheets_sync.py
+
       - name: Persist SQLite state back to repo
         if: always()
         run: |
