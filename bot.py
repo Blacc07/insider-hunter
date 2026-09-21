@@ -1,16 +1,8 @@
 """
 🕵️ Insider Hunter — Phase 1: Discovery (bot.py)
-Runs every 2 min on GitHub Actions (Base network).
-Watches Uniswap V3 + Aerodrome factories for new pools,
-extracts first buyers, stores everything in SQLite.
-
-v3 CHANGES (cron-gap insurance):
-- SCAN_BLOCK_WINDOW widened 100 -> 200 blocks (~6.7 min) so GitHub cron
-  jitter/delays cannot blind the hunter.
-- MAX_SLICES_PER_FACTORY raised 12 -> 22 (21 slices needed for 201 blocks).
-- REQUEST_DELAY_SEC tightened 1.5 -> 1.0 to keep runtime under the cron
-  interval despite the extra slices (still polite to the free tier).
-Indentation: 4 spaces ONLY.
+v4 CHANGES: Added IGNORE_ADDRESSES to filter out Burn Addresses and 
+Uniswap V3 Protocol Contracts (Position Managers/Routers) so we only 
+track real human/syndicate wallets.
 """
 
 import os
@@ -41,10 +33,16 @@ MAX_BUYERS_PER_POOL = 10         # hard cap on first buyers stored per pool
 MAX_TRANSFERS_PER_PAGE = 1000    # Alchemy max per page
 REQUEST_DELAY_SEC = 1.0          # polite delay between Alchemy calls
 
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+# 🛑 THE BOUNCER IGNORE LIST (Protocol mechanics, not real buyers)
+IGNORE_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",  # Zero address
+    "0x000000000000000000000000000000000000dead",  # Dead/Burn address
+    "0x0000000000000000000000000000000000000001",  # Precompile
+    "0x03a520b32c04bf3beef7beb72e919cf822ed34f1",  # Uniswap V3 Position Manager (Base)
+    "0x2626664c2603336e57b271c5c0b26f421741e481",  # Uniswap V3 Swap Router (Base)
+}
 
 # Canonical factory deployments on Base.
-# pool_word_index = which 32-byte word of event `data` holds the pool address.
 FACTORIES = {
     "uniswap_v3": {
         "label": "Uniswap V3",
@@ -80,7 +78,6 @@ def short(addr: str) -> str:
 
 
 def event_topic(signature: str) -> str:
-    """Compute topic0 = keccak256(event signature). No hardcoded hashes."""
     digest = keccak.new(digest_bits=256)
     digest.update(signature.encode("utf-8"))
     return "0x" + digest.hexdigest()
@@ -135,7 +132,6 @@ def init_db() -> sqlite3.Connection:
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    """Safe migration for older DB files: add column only if missing."""
     cur = conn.execute(f"PRAGMA table_info({table})")
     columns = [row[1] for row in cur.fetchall()]
     if column not in columns:
@@ -217,7 +213,6 @@ def alchemy_call(method: str, params: list, retries: int = 3):
             continue
 
         if 400 <= resp.status_code < 500:
-            # Deterministic client error (bad params/range): retrying is useless.
             body = (resp.text or "")[:300].replace("\n", " ")
             log(f"❌ Alchemy {resp.status_code} on {method} (client error, NOT retrying): {body}")
             return None
@@ -228,7 +223,6 @@ def alchemy_call(method: str, params: list, retries: int = 3):
                 time.sleep(3 * attempt)
             continue
 
-        # 2xx -> parse JSON-RPC envelope
         try:
             data = resp.json()
         except ValueError as exc:
@@ -242,7 +236,7 @@ def alchemy_call(method: str, params: list, retries: int = 3):
             log(f"⚠️ Alchemy RPC error on {method}: {err.get('message', 'unknown')}")
             return None
 
-        time.sleep(REQUEST_DELAY_SEC)  # free-tier courtesy delay
+        time.sleep(REQUEST_DELAY_SEC)
         return data.get("result")
     return None
 
@@ -261,7 +255,6 @@ def get_latest_block():
 # 🔎 DISCOVERY (10-block slices = free-tier legal)
 # ---------------------------------------------------------------------------
 def build_slices(from_block: int, to_block: int) -> tuple:
-    """Split [from_block, to_block] into <=FREE_TIER_LOG_RANGE chunks, capped."""
     slices = []
     start = from_block
     while start <= to_block and len(slices) < MAX_SLICES_PER_FACTORY:
@@ -272,7 +265,6 @@ def build_slices(from_block: int, to_block: int) -> tuple:
 
 
 def parse_pool_created(factory: dict, entry: dict) -> dict:
-    """Null-safe parser for one PoolCreated log entry."""
     if not isinstance(entry, dict):
         return None
     topics = entry.get("topics") or []
@@ -342,15 +334,10 @@ def pick_target_token(token0, token1):
         return t0
     if t0 in QUOTE_TOKENS and t1 not in QUOTE_TOKENS:
         return t1
-    return None  # ambiguous pair -> skip, never guess
+    return None
 
 
 def get_first_buyers(pool_address: str, target_token: str, created_block: int) -> list:
-    """
-    Heuristic: a BUY = ERC-20 transfer FROM the pool TO a wallet
-    (the pool pays out the token when someone swaps into it).
-    Pages ascending, capped at MAX_PAGES and MAX_BUYERS_PER_POOL.
-    """
     buyers = []
     seen = set()
     page_key = None
@@ -382,8 +369,11 @@ def get_first_buyers(pool_address: str, target_token: str, created_block: int) -
             if not isinstance(transfer, dict):
                 continue
             wallet = (transfer.get("to") or "").lower()
-            if not wallet or wallet in (pool_address.lower(), ZERO_ADDRESS):
+            
+            # 🛑 BOUNCER CHECK: Ignore pool, zero, dead, and router addresses
+            if not wallet or wallet in IGNORE_ADDRESSES or wallet == pool_address.lower():
                 continue
+                
             if wallet in seen:
                 continue
             seen.add(wallet)
