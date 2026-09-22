@@ -1,8 +1,9 @@
 """
 🟣 Solana Momentum & Breakout Tracker (solana_breakout.py)
-v3: Pulls DexScreener's "Latest Token Profiles" firehose (fresh Solana
-memecoins) instead of the stale 'search?q=SOL' endpoint.
-Fast (no per-pair sleeps), null-safe, hard-capped, free-tier friendly.
+v3.1 FIX: DexScreener's /latest/dex/tokens endpoint returns an OBJECT
+({"pairs": [...]}), not a bare list. v3 discarded it silently, causing
+"No fresh pairs returned" on every run. Now parses both shapes and
+logs every pipeline stage so nothing can fail silently again.
 """
 
 import os
@@ -87,13 +88,14 @@ def send_telegram(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 🌐 DEXSCREENER (v3 firehose: profiles -> pair data)
+# 🌐 DEXSCREENER (v3.1: profiles firehose -> pair data, fully logged)
 # ---------------------------------------------------------------------------
 def fetch_latest_solana_pairs() -> list:
+    # Step 1: latest token profiles across all chains (returns a JSON array)
     try:
         resp = requests.get(PROFILES_URL, timeout=15)
         if resp.status_code == 429:
-            log("⚠️ DexScreener 429 rate limit. Sleeping 10s, skipping run.")
+            log("⚠️ DexScreener 429 on profiles. Sleeping 10s, skipping run.")
             time.sleep(10)
             return []
         resp.raise_for_status()
@@ -105,7 +107,10 @@ def fetch_latest_solana_pairs() -> list:
         log(f"⚠️ Profiles bad JSON: {exc}")
         return []
 
+    if isinstance(profiles, dict):
+        profiles = profiles.get("profiles") or profiles.get("tokens") or []
     if not isinstance(profiles, list):
+        log(f"⚠️ Unexpected profiles payload type: {type(profiles).__name__}")
         return []
 
     sol_addresses = []
@@ -115,10 +120,13 @@ def fetch_latest_solana_pairs() -> list:
             if addr:
                 sol_addresses.append(addr)
 
+    log(f"📡 Profiles fetched: {len(profiles)} | Solana profiles: {len(sol_addresses)}")
+
     if not sol_addresses:
-        log("⚠️ No new Solana profiles in the latest feed.")
+        log("⚠️ No new Solana profiles in the latest feed (market quiet right now).")
         return []
 
+    # Step 2: live pair data for those tokens (comma-separated batch, max 30)
     batch = sol_addresses[:MAX_PAIRS_PER_RUN]
     try:
         resp2 = requests.get(f"{TOKENS_URL}{','.join(batch)}", timeout=15)
@@ -127,7 +135,7 @@ def fetch_latest_solana_pairs() -> list:
             time.sleep(10)
             return []
         resp2.raise_for_status()
-        pairs = resp2.json()
+        data = resp2.json()
     except requests.exceptions.RequestException as exc:
         log(f"⚠️ Pair data fetch failed: {exc}")
         return []
@@ -135,7 +143,21 @@ def fetch_latest_solana_pairs() -> list:
         log(f"⚠️ Pair data bad JSON: {exc}")
         return []
 
-    return pairs if isinstance(pairs, list) else []
+    # v3.1 FIX: endpoint returns {"pairs": [...]} — tolerate bare list too
+    if isinstance(data, dict):
+        pairs = data.get("pairs") or []
+    elif isinstance(data, list):
+        pairs = data
+    else:
+        log(f"⚠️ Unexpected token-batch payload type: {type(data).__name__}")
+        return []
+
+    if not isinstance(pairs, list):
+        log(f"⚠️ Unexpected pairs payload type: {type(pairs).__name__}")
+        return []
+
+    log(f"📦 Pairs loaded for batch of {len(batch)} token(s): {len(pairs)}")
+    return pairs
 
 
 def vol_5m(pair) -> float:
@@ -214,7 +236,7 @@ def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
 # ---------------------------------------------------------------------------
 def main() -> None:
     started = time.time()
-    log("🟣 Solana Breakout Tracker (v3 Firehose) starting scan...")
+    log("🟣 Solana Breakout Tracker (v3.1 Firehose) starting scan...")
     conn = init_db()
 
     pairs = fetch_latest_solana_pairs()
@@ -224,7 +246,7 @@ def main() -> None:
         return
 
     pairs.sort(key=vol_5m, reverse=True)
-    log(f"🔎 Analyzing {len(pairs)} fresh Solana profiles...")
+    log(f"🔎 Analyzing {len(pairs)} fresh Solana pairs (hottest first)...")
 
     alerts = 0
     for pair in pairs:
