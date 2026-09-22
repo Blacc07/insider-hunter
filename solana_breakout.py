@@ -19,12 +19,16 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
 
-# 🎯 THE ALPHA FILTERS (The secret sauce)
-MAX_PAIR_AGE_HOURS = 6       # Only look at tokens created in the last 6 hours
-MIN_LIQUIDITY_USD = 25000    # Must have at least $25k in LP (Filters out 99% of rugs)
-MIN_5M_VOLUME_USD = 50000    # Must have $50k volume in the last 5 mins (Shows momentum)
-MIN_5M_PRICE_CHANGE = 15.0   # Must be pumping at least 15% in the last 5 mins
-MAX_MCAP_USD = 2000000       # Don't buy if it's already a $2M+ giant (Too late)
+# 🎯 CALIBRATION MODE (Looser filters to map the current market)
+MAX_PAIR_AGE_HOURS = 24      # Look back a full day
+MIN_LIQUIDITY_USD = 10000    # $10k LP (Still filters out micro-rugs)
+MIN_5M_VOLUME_USD = 10000    # $10k volume (Catches earlier momentum)
+MIN_5M_PRICE_CHANGE = 5.0    # +5% pump (Catches steady grinds, not just vertical spikes)
+MAX_MCAP_USD = 5000000       # Up to $5M mcap
+
+# ⛔ HARD CAPS 
+MAX_PAIRS_PER_RUN = 200      
+MAX_ALERTS_PER_RUN = 5       # Allow up to 5 alerts per run so we can study them
 
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search?q=SOL"
 REQUEST_DELAY_SEC = 2.0      # Polite delay for free public API
