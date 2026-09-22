@@ -1,23 +1,68 @@
 """
-📊 Solana Performance Tracker (solana_tracker.py)
-Monitors tokens alerted in the last 8 hours.
-Sends milestone updates to Telegram at 1h, 4h, and 8h marks.
+🟣 Solana Momentum & Breakout Tracker (solana_breakout.py)
+v3.2: Added token_address to the SQLite database so the Tracker Bot 
+can monitor post-alert performance.
 """
 
 import os
 import sqlite3
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
+
+MAX_PAIR_AGE_HOURS = 24
+MIN_LIQUIDITY_USD = 10000
+MIN_5M_VOLUME_USD = 10000
+MIN_5M_PRICE_CHANGE = 5.0
+MAX_MCAP_USD = 5000000
+MAX_PAIRS_PER_RUN = 30
+MAX_ALERTS_PER_RUN = 5
+
+PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
+
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerted_tokens (
+            pair_address TEXT PRIMARY KEY,
+            token_symbol TEXT,
+            token_address TEXT,
+            first_alerted TEXT,
+            mcap_at_alert REAL,
+            updates_sent TEXT DEFAULT ''
+        )
+        """
+    )
+    # Safe migration for existing DBs
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(alerted_tokens)").fetchall()]
+    if 'token_address' not in cols:
+        conn.execute("ALTER TABLE alerted_tokens ADD COLUMN token_address TEXT DEFAULT ''")
+    if 'updates_sent' not in cols:
+        conn.execute("ALTER TABLE alerted_tokens ADD COLUMN updates_sent TEXT DEFAULT ''")
+    conn.commit()
+    return conn
+
+def is_already_alerted(conn: sqlite3.Connection, pair_address: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM alerted_tokens WHERE pair_address = ?", (pair_address,))
+    return cur.fetchone() is not None
+
+def record_alert(conn, pair_address, symbol, token_address, mcap) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO alerted_tokens (pair_address, token_symbol, token_address, first_alerted, mcap_at_alert, updates_sent) "
+        "VALUES (?, ?, ?, ?, ?, '')",
+        (pair_address, symbol, token_address, datetime.now(timezone.utc).isoformat(), mcap),
+    )
+    conn.commit()
 
 def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -27,112 +72,97 @@ def send_telegram(text: str) -> None:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
-    except Exception as exc:
-        log(f"⚠️ Telegram failed: {exc}")
+    except requests.exceptions.RequestException as exc:
+        log(f"⚠️ Telegram notify failed (non-fatal): {exc}")
 
-def get_active_tracks(conn: sqlite3.Connection) -> list:
-    """Fetches tokens alerted within the last 8 hours."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
-    cur = conn.execute(
-        "SELECT pair_address, token_symbol, token_address, first_alerted, mcap_at_alert, updates_sent "
-        "FROM alerted_tokens WHERE first_alerted >= ? AND token_address != ''",
-        (cutoff,)
-    )
-    return cur.fetchall()
-
-def fetch_current_mcaps(addresses: list) -> dict:
-    """Batches addresses and fetchs current MCap from DexScreener."""
-    if not addresses: return {}
-    batch = addresses[:30] # DexScreener limit
+def fetch_latest_solana_pairs() -> list:
     try:
-        resp = requests.get(f"{TOKENS_URL}{','.join(batch)}", timeout=15)
-        if resp.status_code == 429: time.sleep(10); return {}
+        resp = requests.get(PROFILES_URL, timeout=15)
+        if resp.status_code == 429: time.sleep(10); return []
         resp.raise_for_status()
-        data = resp.json()
-        pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        
-        # Map token_address -> current_mcap (take the highest liquidity pair for that token)
-        mcap_map = {}
-        for p in pairs:
-            if not isinstance(p, dict): continue
-            token_addr = (p.get("baseToken") or {}).get("address", "")
-            mcap = p.get("marketCap") or p.get("fdv") or 0
-            if token_addr and mcap:
-                try:
-                    mcap = float(mcap)
-                    if token_addr not in mcap_map or mcap > mcap_map[token_addr]:
-                        mcap_map[token_addr] = mcap
-                except: pass
-        return mcap_map
-    except Exception as e:
-        log(f"⚠️ Tracker fetch failed: {e}")
-        return {}
+        profiles = resp.json()
+    except Exception as e: log(f"⚠️ Profiles fetch failed: {e}"); return []
+
+    if isinstance(profiles, dict): profiles = profiles.get("profiles") or []
+    if not isinstance(profiles, list): return []
+
+    sol_addresses = [p.get("tokenAddress") for p in profiles if isinstance(p, dict) and p.get("chainId") == "solana" and p.get("tokenAddress")]
+    log(f"📡 Profiles fetched: {len(profiles)} | Solana profiles: {len(sol_addresses)}")
+    if not sol_addresses: return []
+
+    batch = sol_addresses[:MAX_PAIRS_PER_RUN]
+    try:
+        resp2 = requests.get(f"{TOKENS_URL}{','.join(batch)}", timeout=15)
+        if resp2.status_code == 429: time.sleep(10); return []
+        resp2.raise_for_status()
+        data = resp2.json()
+    except Exception as e: log(f"⚠️ Pair data fetch failed: {e}"); return []
+
+    pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    log(f"📦 Pairs loaded for batch of {len(batch)} token(s): {len(pairs)}")
+    return pairs if isinstance(pairs, list) else []
+
+def vol_5m(pair) -> float:
+    try: return float((pair.get("volume") or {}).get("m5") or 0.0)
+    except: return 0.0
+
+def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
+    if pair.get("chainId", "") != "solana": return False
+    pair_addr = pair.get("pairAddress", "")
+    if not pair_addr or is_already_alerted(conn, pair_addr): return False
+
+    liquidity = (pair.get("liquidity") or {}).get("usd") or 0
+    volume_5m = vol_5m(pair)
+    price_change_5m = (pair.get("priceChange") or {}).get("m5") or 0
+    mcap = pair.get("marketCap") or pair.get("fdv") or 0
+    created_at = pair.get("pairCreatedAt") or 0
+
+    try: liquidity, price_change_5m, mcap = float(liquidity), float(price_change_5m), float(mcap)
+    except: return False
+
+    age_hours = ((time.time() * 1000 - created_at) / (1000 * 60 * 60)) if created_at > 0 else 9999
+
+    if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_5M_VOLUME_USD: return False
+    if price_change_5m < MIN_5M_PRICE_CHANGE or age_hours > MAX_PAIR_AGE_HOURS: return False
+    if mcap > MAX_MCAP_USD: return False
+
+    symbol = (pair.get("baseToken") or {}).get("symbol", "UNKNOWN")
+    token_addr = (pair.get("baseToken") or {}).get("address", "")
+    dex_id = pair.get("dexId", "unknown")
+
+    record_alert(conn, pair_addr, symbol, token_addr, mcap)
+
+    alert_msg = (
+        f"🔥 <b>SOLANA MOMENTUM BREAKOUT</b> 🔥\n"
+        f"🪙 <b>{symbol}</b>\n🏦 DEX: {str(dex_id).capitalize()}\n\n"
+        f"💰 <b>MCap:</b> ${mcap:,.0f}\n💧 <b>Liquidity:</b> ${liquidity:,.0f}\n"
+        f"📈 <b>5m Vol:</b> ${volume_5m:,.0f}\n🚀 <b>5m Change:</b> +{price_change_5m:.1f}%\n\n"
+        f"🔗 <a href='https://dexscreener.com/solana/{pair_addr}'>DexScreener</a> | "
+        f"<a href='https://birdeye.so/token/{token_addr}?chain=solana'>Birdeye</a>\n"
+        f"📋 <code>{token_addr}</code>"
+    )
+    send_telegram(alert_msg)
+    log(f"🔥 ALERT SENT: {symbol} | MCap: ${mcap:,.0f}")
+    return True
 
 def main() -> None:
-    log("📊 Solana Tracker starting 8h performance check...")
-    if not os.path.exists(DB_PATH):
-        log("⚠️ DB not found. Exiting.")
-        return
+    started = time.time()
+    log("🟣 Solana Breakout Tracker (v3.2) starting scan...")
+    conn = init_db()
+    pairs = fetch_latest_solana_pairs()
+    if not pairs:
+        log("⚠️ No fresh pairs returned. Sleeping.")
+        conn.close(); return
 
-    conn = sqlite3.connect(DB_PATH)
-    tracks = get_active_tracks(conn)
-    
-    if not tracks:
-        log("🔍 No active tracks in the last 8 hours. Sleeping.")
-        conn.close()
-        return
-
-    log(f"🔎 Tracking {len(tracks)} active token(s)...")
-    addresses = [row[2] for row in tracks] # token_address is index 2
-    current_mcaps = fetch_current_mcaps(addresses)
-
-    updates_fired = 0
-    for row in tracks:
-        pair_addr, symbol, token_addr, first_alerted_str, initial_mcap, updates_sent = row
-        
-        current_mcap = current_mcaps.get(token_addr)
-        if not current_mcap or initial_mcap <= 0:
-            continue
-
-        roi_pct = ((current_mcap - initial_mcap) / initial_mcap) * 100
-        
-        # Calculate age in hours
-        first_alerted_dt = datetime.fromisoformat(first_alerted_str)
-        age_hours = (datetime.now(timezone.utc) - first_alerted_dt).total_seconds() / 3600
-        
-        # Determine which milestone to fire
-        milestone = None
-        if age_hours >= 8.0 and "8h" not in updates_sent:
-            milestone = "8h"
-            emoji = "🏁"
-        elif age_hours >= 4.0 and "4h" not in updates_sent:
-            milestone = "4h"
-            emoji = "⏳"
-        elif age_hours >= 1.0 and "1h" not in updates_sent:
-            milestone = "1h"
-            emoji = "🕒"
-            
-        if milestone:
-            roi_emoji = "🟢" if roi_pct >= 0 else "🔴"
-            msg = (
-                f"{emoji} <b>{milestone.upper()} PERFORMANCE UPDATE</b> {emoji}\n"
-                f"🪙 <b>{symbol}</b>\n\n"
-                f"💰 <b>Entry MCap:</b> ${initial_mcap:,.0f}\n"
-                f"💸 <b>Current MCap:</b> ${current_mcap:,.0f}\n"
-                f"📊 <b>ROI:</b> {roi_emoji} <b>{roi_pct:+.1f}%</b>\n\n"
-                f"🔗 <a href='https://dexscreener.com/solana/{pair_addr}'>View Chart</a>"
-            )
-            send_telegram(msg)
-            
-            # Update DB to prevent duplicate alerts
-            new_updates = f"{updates_sent},{milestone}" if updates_sent else milestone
-            conn.execute("UPDATE alerted_tokens SET updates_sent = ? WHERE pair_address = ?", (new_updates, pair_addr))
-            conn.commit()
-            updates_fired += 1
-            log(f"📈 {symbol} {milestone} Update: {roi_pct:+.1f}%")
+    pairs.sort(key=vol_5m, reverse=True)
+    log(f"🔎 Analyzing {len(pairs)} fresh Solana pairs...")
+    alerts = 0
+    for pair in pairs:
+        if alerts >= MAX_ALERTS_PER_RUN: break
+        if isinstance(pair, dict) and analyze_pair(pair, conn): alerts += 1
 
     conn.close()
-    log(f"✅ Tracker complete. Fired {updates_fired} milestone update(s).")
+    log(f"✅ Scan complete. {alerts} alert(s) in {time.time() - started:.1f}s.")
 
 if __name__ == "__main__":
     main()
