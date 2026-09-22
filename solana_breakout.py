@@ -1,8 +1,8 @@
 """
 🟣 Solana Momentum & Breakout Tracker (solana_breakout.py)
-v3 UPGRADE: Switched from generic 'SOL' search to DexScreener's 
-"Latest Token Profiles" firehose. This targets actually new, actively 
-promoted Solana memecoins instead of stale wrapped-SOL pairs.
+v3: Pulls DexScreener's "Latest Token Profiles" firehose (fresh Solana
+memecoins) instead of the stale 'search?q=SOL' endpoint.
+Fast (no per-pair sleeps), null-safe, hard-capped, free-tier friendly.
 """
 
 import os
@@ -12,22 +12,20 @@ import requests
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# ⚙️ CONFIGURATION (Calibration Mode Active)
+# ⚙️ CONFIGURATION (Calibration Mode active)
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
 
-# 🎯 CALIBRATION FILTERS (Tuned for fresh memecoins)
-MAX_PAIR_AGE_HOURS = 24      # Look back a full day
-MIN_LIQUIDITY_USD = 10000    # $10k LP (Filters out micro-rugs)
-MIN_5M_VOLUME_USD = 10000    # $10k volume (Catches early momentum)
-MIN_5M_PRICE_CHANGE = 5.0    # +5% pump (Catches steady grinds)
-MAX_MCAP_USD = 5000000       # Up to $5M mcap
+MAX_PAIR_AGE_HOURS = 24      # only young tokens
+MIN_LIQUIDITY_USD = 10000    # rug filter
+MIN_5M_VOLUME_USD = 10000    # momentum filter
+MIN_5M_PRICE_CHANGE = 5.0    # breakout filter
+MAX_MCAP_USD = 5000000       # skip already-huge caps
 
-# ⛔ HARD CAPS 
-MAX_PAIRS_PER_RUN = 30       # DexScreener token batch limit
-MAX_ALERTS_PER_RUN = 5       # Max Telegram alerts per run
+MAX_PAIRS_PER_RUN = 30       # DexScreener batch limit + hard cap
+MAX_ALERTS_PER_RUN = 5       # Telegram spam guard
 
 PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
@@ -39,7 +37,7 @@ def log(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 🗄️ SQLITE (Deduplication Memory)
+# 🗄️ SQLITE (dedup memory)
 # ---------------------------------------------------------------------------
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -89,47 +87,55 @@ def send_telegram(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 🌐 DEXSCREENER API (v3: Latest Profiles Firehose)
+# 🌐 DEXSCREENER (v3 firehose: profiles -> pair data)
 # ---------------------------------------------------------------------------
 def fetch_latest_solana_pairs() -> list:
-    # Step 1: Get the absolute latest token profiles across all chains
     try:
         resp = requests.get(PROFILES_URL, timeout=15)
         if resp.status_code == 429:
-            log("⚠️ DexScreener 429 Rate Limit. Sleeping 10s.")
+            log("⚠️ DexScreener 429 rate limit. Sleeping 10s, skipping run.")
             time.sleep(10)
             return []
         resp.raise_for_status()
         profiles = resp.json()
-    except Exception as e:
-        log(f"⚠️ Profiles fetch failed: {e}")
+    except requests.exceptions.RequestException as exc:
+        log(f"⚠️ Profiles fetch failed: {exc}")
         return []
-        
-    # Step 2: Filter strictly for Solana and extract token addresses
+    except ValueError as exc:
+        log(f"⚠️ Profiles bad JSON: {exc}")
+        return []
+
+    if not isinstance(profiles, list):
+        return []
+
     sol_addresses = []
     for p in profiles:
         if isinstance(p, dict) and p.get("chainId") == "solana":
-            addr = p.get("tokenAddress")
+            addr = p.get("tokenAddress") or ""
             if addr:
                 sol_addresses.append(addr)
-                
+
     if not sol_addresses:
-        log("⚠️ No new Solana profiles found in the latest feed.")
+        log("⚠️ No new Solana profiles in the latest feed.")
         return []
-        
-    # Step 3: Fetch live pair data for these tokens (DexScreener allows comma-separated batches)
-    # We cap at 30 to respect the API limit and our MAX_PAIRS_PER_RUN
+
     batch = sol_addresses[:MAX_PAIRS_PER_RUN]
-    token_str = ",".join(batch)
-    
     try:
-        resp2 = requests.get(f"{TOKENS_URL}{token_str}", timeout=15)
+        resp2 = requests.get(f"{TOKENS_URL}{','.join(batch)}", timeout=15)
+        if resp2.status_code == 429:
+            log("⚠️ DexScreener 429 on token batch. Sleeping 10s, skipping run.")
+            time.sleep(10)
+            return []
         resp2.raise_for_status()
         pairs = resp2.json()
-        return pairs if isinstance(pairs, list) else []
-    except Exception as e:
-        log(f"⚠️ Pair data fetch failed: {e}")
+    except requests.exceptions.RequestException as exc:
+        log(f"⚠️ Pair data fetch failed: {exc}")
         return []
+    except ValueError as exc:
+        log(f"⚠️ Pair data bad JSON: {exc}")
+        return []
+
+    return pairs if isinstance(pairs, list) else []
 
 
 def vol_5m(pair) -> float:
@@ -143,7 +149,7 @@ def vol_5m(pair) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 🧠 THE ALPHA ENGINE
+# 🧠 ALPHA ENGINE (returns True only when an alert fired)
 # ---------------------------------------------------------------------------
 def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
     if pair.get("chainId", "") != "solana":
@@ -168,12 +174,16 @@ def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
 
     age_hours = ((time.time() * 1000 - created_at) / (1000 * 60 * 60)) if created_at > 0 else 9999
 
-    # Apply Calibration Filters
-    if liquidity < MIN_LIQUIDITY_USD: return False
-    if volume_5m < MIN_5M_VOLUME_USD: return False
-    if price_change_5m < MIN_5M_PRICE_CHANGE: return False
-    if age_hours > MAX_PAIR_AGE_HOURS: return False
-    if mcap > MAX_MCAP_USD: return False
+    if liquidity < MIN_LIQUIDITY_USD:
+        return False
+    if volume_5m < MIN_5M_VOLUME_USD:
+        return False
+    if price_change_5m < MIN_5M_PRICE_CHANGE:
+        return False
+    if age_hours > MAX_PAIR_AGE_HOURS:
+        return False
+    if mcap > MAX_MCAP_USD:
+        return False
 
     symbol = (pair.get("baseToken") or {}).get("symbol", "UNKNOWN")
     name = (pair.get("baseToken") or {}).get("name", "Unknown Token")
@@ -213,7 +223,6 @@ def main() -> None:
         conn.close()
         return
 
-    # Sort by 5m volume descending (hottest first)
     pairs.sort(key=vol_5m, reverse=True)
     log(f"🔎 Analyzing {len(pairs)} fresh Solana profiles...")
 
@@ -227,7 +236,8 @@ def main() -> None:
             alerts += 1
 
     conn.close()
-    log(f"✅ Scan complete. {alerts} new breakout(s) alerted in {time.time() - started:.1f}s.")
+    log(f"✅ Scan complete. Analyzed {len(pairs)} pair(s), {alerts} new breakout(s) "
+        f"alerted in {time.time() - started:.1f}s.")
 
 
 if __name__ == "__main__":
