@@ -2,7 +2,7 @@ name: solana-breakout
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # Runs every 15 minutes
+    - cron: "*/2 * * * *"   # every 2 min: fast enough for trailing stops
   workflow_dispatch:
 
 permissions:
@@ -27,17 +27,17 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Solana Breakout Tracker (Discovery)
+      - name: Run Solana Breakout (Discovery)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python solana_breakout.py
 
-      - name: Run Solana Performance Tracker (8h Follow-up)
+      - name: Run Cloud Take-Profit Tracker (4 Rules)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python solana_tracker.py
+        run: python tp_tracker.py
 
       - name: Persist SQLite state
         if: always()
