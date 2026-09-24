@@ -1,6 +1,7 @@
 name: solana-breakout
 
-  workflow_dispatch:
+on:
+  workflow_dispatch:   # triggered by the cron-job.org heartbeat every 5 minutes
 
 permissions:
   contents: write
