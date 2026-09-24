@@ -1,8 +1,5 @@
 name: solana-breakout
 
-on:
-  schedule:
-    - cron: "*/2 * * * *"   # every 2 min: fast enough for trailing stops
   workflow_dispatch:
 
 permissions:
