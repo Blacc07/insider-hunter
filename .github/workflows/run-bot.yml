@@ -1,9 +1,7 @@
 name: run-bot
 
 on:
-  schedule:
-    - cron: "*/2 * * * *"
-  workflow_dispatch:
+  workflow_dispatch:   # driven by the cron-job.org Base heartbeat every 5 minutes
 
 permissions:
   contents: write
@@ -27,21 +25,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot (Discovery)
+      - name: Run Phase 1 - Discovery (bot.py)
         env:
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
 
-      - name: Run profiler (Forensic Analysis)
+      - name: Run Phase 2 - Forensic Profiler (wallet_profiler.py)
         env:
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python wallet_profiler.py
 
-      - name: Run sheets sync (Dashboard)
+      - name: Run Phase 4 - Pre-Launch Syndicate Tracker (funder_tracker.py)
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python funder_tracker.py
+
+      - name: Run Sheets Sync (Dashboard)
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -54,17 +59,7 @@ jobs:
           git config user.email "insider-hunter-bot@users.noreply.github.com"
           git add insider_hunter.db || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore: persist sqlite state [skip ci]"
-            git push
+            git commit -m "chore: persist base state [skip ci]"
+            git pull --rebase origin main || true
+            git push || { git pull --rebase origin main && git push; }
           fi
-
-# ... (Previous steps: Checkout, Setup Python, pip install, bot.py, wallet_profiler.py) ...
-
-      - name: Run Phase 4 - Pre-Launch Syndicate Tracker
-        env:
-          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python funder_tracker.py
-
-# ... (Next steps: sheets_sync.py, git commit, etc.) ...
