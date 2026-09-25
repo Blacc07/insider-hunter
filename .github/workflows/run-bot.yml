@@ -57,3 +57,14 @@ jobs:
             git commit -m "chore: persist sqlite state [skip ci]"
             git push
           fi
+
+# ... (Previous steps: Checkout, Setup Python, pip install, bot.py, wallet_profiler.py) ...
+
+      - name: Run Phase 4 - Pre-Launch Syndicate Tracker
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python funder_tracker.py
+
+# ... (Next steps: sheets_sync.py, git commit, etc.) ...
