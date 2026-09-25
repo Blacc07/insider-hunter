@@ -1,7 +1,7 @@
 name: solana-breakout
 
 on:
-  workflow_dispatch:   # triggered by the cron-job.org heartbeat every 5 minutes
+  workflow_dispatch:   # driven by the cron-job.org Solana heartbeat every 5 minutes
 
 permissions:
   contents: write
@@ -45,5 +45,6 @@ jobs:
           git add solana_breakout.db || true
           if ! git diff --cached --quiet; then
             git commit -m "chore: persist solana state [skip ci]"
-            git push
+            git pull --rebase origin main || true
+            git push || { git pull --rebase origin main && git push; }
           fi
