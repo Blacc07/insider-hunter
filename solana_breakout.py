@@ -1,7 +1,8 @@
 """
 🟣 Solana Momentum & Breakout Tracker (solana_breakout.py)
-v3.2: Added token_address to the SQLite database so the Tracker Bot 
-can monitor post-alert performance.
+v4 UPGRADE: Added 1-Hour Trend Filter and raised liquidity floor.
+Based on 170-trade paper data, this filters out 5-minute flash-pump 
+wash trades that were causing the 131 hard-stops (-40%).
 """
 
 import os
@@ -14,11 +15,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
 
-MAX_PAIR_AGE_HOURS = 24
-MIN_LIQUIDITY_USD = 10000
-MIN_5M_VOLUME_USD = 10000
-MIN_5M_PRICE_CHANGE = 5.0
-MAX_MCAP_USD = 5000000
+# 🎯 TUNED FILTERS (Based on 170-trade autopsy)
+MAX_PAIR_AGE_HOURS = 12      # Tightened from 24h (fresher momentum)
+MIN_LIQUIDITY_USD = 25000    # Raised from 10k (filters out micro-cap instant dumps)
+MIN_5M_VOLUME_USD = 15000    # Raised from 10k
+MIN_5M_PRICE_CHANGE = 8.0    # Slightly lowered to catch the start of the move
+MIN_1H_PRICE_CHANGE = 15.0   # NEW: Must be up 15% on the hour (kills 5m flash-in-the-pan wash trades)
+MAX_MCAP_USD = 5000000       
 MAX_PAIRS_PER_RUN = 30
 MAX_ALERTS_PER_RUN = 5
 
@@ -43,7 +46,6 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
-    # Safe migration for existing DBs
     cols = [row[1] for row in conn.execute("PRAGMA table_info(alerted_tokens)").fetchall()]
     if 'token_address' not in cols:
         conn.execute("ALTER TABLE alerted_tokens ADD COLUMN token_address TEXT DEFAULT ''")
@@ -114,16 +116,26 @@ def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
     liquidity = (pair.get("liquidity") or {}).get("usd") or 0
     volume_5m = vol_5m(pair)
     price_change_5m = (pair.get("priceChange") or {}).get("m5") or 0
+    price_change_1h = (pair.get("priceChange") or {}).get("h1") or 0 # NEW: 1-Hour Trend
     mcap = pair.get("marketCap") or pair.get("fdv") or 0
     created_at = pair.get("pairCreatedAt") or 0
 
-    try: liquidity, price_change_5m, mcap = float(liquidity), float(price_change_5m), float(mcap)
+    try: 
+        liquidity = float(liquidity)
+        volume_5m = float(volume_5m)
+        price_change_5m = float(price_change_5m)
+        price_change_1h = float(price_change_1h)
+        mcap = float(mcap)
     except: return False
 
     age_hours = ((time.time() * 1000 - created_at) / (1000 * 60 * 60)) if created_at > 0 else 9999
 
-    if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_5M_VOLUME_USD: return False
-    if price_change_5m < MIN_5M_PRICE_CHANGE or age_hours > MAX_PAIR_AGE_HOURS: return False
+    # 🛡️ STRICT V4 FILTERS
+    if liquidity < MIN_LIQUIDITY_USD: return False
+    if volume_5m < MIN_5M_VOLUME_USD: return False
+    if price_change_5m < MIN_5M_PRICE_CHANGE: return False
+    if price_change_1h < MIN_1H_PRICE_CHANGE: return False # KILLS THE FAKEOUTS
+    if age_hours > MAX_PAIR_AGE_HOURS: return False
     if mcap > MAX_MCAP_USD: return False
 
     symbol = (pair.get("baseToken") or {}).get("symbol", "UNKNOWN")
@@ -136,18 +148,20 @@ def analyze_pair(pair: dict, conn: sqlite3.Connection) -> bool:
         f"🔥 <b>SOLANA MOMENTUM BREAKOUT</b> 🔥\n"
         f"🪙 <b>{symbol}</b>\n🏦 DEX: {str(dex_id).capitalize()}\n\n"
         f"💰 <b>MCap:</b> ${mcap:,.0f}\n💧 <b>Liquidity:</b> ${liquidity:,.0f}\n"
-        f"📈 <b>5m Vol:</b> ${volume_5m:,.0f}\n🚀 <b>5m Change:</b> +{price_change_5m:.1f}%\n\n"
+        f"📈 <b>5m Vol:</b> ${volume_5m:,.0f}\n"
+        f"🚀 <b>5m Change:</b> +{price_change_5m:.1f}%\n"
+        f"📊 <b>1h Change:</b> +{price_change_1h:.1f}%\n\n"
         f"🔗 <a href='https://dexscreener.com/solana/{pair_addr}'>DexScreener</a> | "
         f"<a href='https://birdeye.so/token/{token_addr}?chain=solana'>Birdeye</a>\n"
         f"📋 <code>{token_addr}</code>"
     )
     send_telegram(alert_msg)
-    log(f"🔥 ALERT SENT: {symbol} | MCap: ${mcap:,.0f}")
+    log(f"🔥 ALERT SENT: {symbol} | MCap: ${mcap:,.0f} | 1h: +{price_change_1h:.1f}%")
     return True
 
 def main() -> None:
     started = time.time()
-    log("🟣 Solana Breakout Tracker (v3.2) starting scan...")
+    log("🟣 Solana Breakout Tracker (v4 Trend Filter) starting scan...")
     conn = init_db()
     pairs = fetch_latest_solana_pairs()
     if not pairs:
