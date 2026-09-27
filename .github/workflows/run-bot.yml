@@ -52,6 +52,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python sheets_sync.py
 
+      - name: Run Phase 5 - Smart Money Convergence Tracker
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python accumulation_tracker.py
+
       - name: Persist SQLite state back to repo
         if: always()
         run: |
