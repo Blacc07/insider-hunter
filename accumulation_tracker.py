@@ -29,8 +29,12 @@ MAX_WALLETS_TO_SCAN = 50
 # Require at least 2 elite wallets to hold the same token to trigger an alert
 MIN_CONVERGENCE_COUNT = 2 
 
-# Ignore tokens with massive supplies or known stablecoins (basic spam filter)
-IGNORE_SYMBOLS = {"USDC", "USDT", "DAI", "WETH", "ETH", "WBTC", "CBETH"}
+# Ignore tokens with massive supplies, stablecoins, and blue-chip memes
+IGNORE_SYMBOLS = {
+    "USDC", "USDT", "DAI", "WETH", "ETH", "WBTC", "CBETH", "AERO",
+    # Blue-chip memes (Too large for a quick 10x micro-cap play)
+    "PEPE", "WIF", "BONK", "FLOKI", "SHIB", "DOGE", "BRETT", "MOG", "POPCAT", "TURBO"
+}
 
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
