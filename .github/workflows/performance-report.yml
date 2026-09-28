@@ -21,8 +21,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Performance Reporter
+      - name: Run Performance Reporter (v7 cohort)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCALP_EPOCH: "2026-09-28T20:26:09+00:00"   # ← REPLACE with YOUR Step-1 output, keep the quotes
         run: python performance_report.py
