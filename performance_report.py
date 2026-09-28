@@ -1,8 +1,7 @@
 """
-📈 Paper-Trade Performance Reporter v5 (performance_report.py)
-v5: size-weighted statistics (convergence gate), cancelled-entry bucket
-(pending limits that never filled are NOT trades), prove_it exits priced
-from stored exit_mcap.
+📈 Paper-Trade Performance Reporter (performance_report.py) — v7
+Matches the restored ladder: 0.3@2x, 0.2@3x, 0.2@5x, 0.1@10x, remainder at exit.
+Keeps MAE stop-width sensitivity table + SCALP_EPOCH cohort isolation.
 """
 
 import os
@@ -14,18 +13,30 @@ from datetime import datetime, timezone
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+SCALP_EPOCH = os.environ.get("SCALP_EPOCH", "")
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
 TRANCHES = (("tp1", 0.3, 2.0), ("tp2", 0.2, 3.0), ("tp3", 0.2, 5.0), ("tp4", 0.1, 10.0))
 TRAIL_KEEP = 0.75
-HARD_KEEP = 0.75
-MIN_SAMPLE = 20
-GREEN_PF = 1.3
+HARD_KEEP = 0.80
+MIN_SAMPLE = 30
+GREEN_PF = 2.0
+CANDIDATE_STOPS = (0.10, 0.15, 0.20, 0.25, 0.30)
 
 
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except ValueError:
+        return None
 
 
 def col(row, name, default):
@@ -102,10 +113,7 @@ def price_exit(row, entry: float, peak: float, live_map: dict):
     closed = int(col(row, "closed", 0) or 0)
     reason = str(col(row, "close_reason", "") or "")
     exit_mcap = float(col(row, "exit_mcap", 0) or 0)
-    entry_status = str(col(row, "entry_status", "active") or "active")
 
-    if reason == "entry_expired" or entry_status == "cancelled":
-        return None, "cancelled"
     if closed == 0:
         live = live_map.get(row["token_address"])
         if live is None or live <= 0 or entry <= 0:
@@ -123,7 +131,7 @@ def price_exit(row, entry: float, peak: float, live_map: dict):
 
 
 def main() -> None:
-    log("📈 Performance Reporter v5 starting...")
+    log("📈 Performance Reporter v7 (ladder restored) starting...")
     if not os.path.exists(DB_PATH):
         log("❌ DB not found. Nothing to report.")
         return
@@ -135,53 +143,46 @@ def main() -> None:
         conn.close()
         return
 
+    epoch_dt = parse_iso(SCALP_EPOCH)
     alerts = conn.execute("SELECT COUNT(*) AS c FROM alerted_tokens").fetchone()["c"] or 0
     rows = conn.execute("SELECT * FROM tp_state").fetchall()
     conn.close()
 
-    open_addrs = [r["token_address"] for r in rows
-                  if int(col(r, "closed", 0) or 0) == 0 and str(col(r, "entry_status", "active")) == "active"]
+    open_addrs = [r["token_address"] for r in rows if int(col(r, "closed", 0) or 0) == 0]
     live_map = fetch_live_mcaps(open_addrs) if open_addrs else {}
 
-    priced, unpriced, opens, cancels, bad = [], [], [], 0, 0
-    gated_full = gated_half = 0
+    priced, opens, legacy_excluded, unpriced = [], [], 0, 0
     for r in rows:
+        started = parse_iso(col(r, "started_ts", ""))
+        if epoch_dt is not None and (started is None or started < epoch_dt):
+            legacy_excluded += 1
+            continue
         entry = float(col(r, "entry_mcap", 0) or 0)
         peak = float(col(r, "peak_mcap", 0) or 0)
-        size = float(col(r, "size_mult", 1.0) or 1.0)
         flags = {name: col(r, name, 0) for name, _, _ in TRANCHES}
+        if entry <= 0:
+            continue
         mult, tag = price_exit(r, entry, peak, live_map)
-        if tag == "cancelled":
-            cancels += 1
-            continue
-        if entry <= 0 and tag != "open":
-            bad += 1
-            continue
-        if size >= 1.0:
-            gated_full += 1
-        else:
-            gated_half += 1
         item = {
             "symbol": col(r, "symbol", "?"),
             "reason": str(col(r, "close_reason", "") or ""),
             "ret": strategy_return_pct(mult, flags) if mult is not None else None,
-            "size": size,
-            "mfe": ((peak - entry) / entry) * 100.0 if (peak > 0 and entry > 0) else 0.0,
+            "mfe": ((peak - entry) / entry) * 100.0 if peak > 0 else 0.0,
             "mult": mult,
+            "entry": entry,
+            "tp1_hit": int(col(r, "tp1", 0) or 0) == 1,
+            "mae": float(col(r, "mae_mcap", 0) or 0),
         }
         if tag in ("exact", "reconstructed"):
             priced.append(item)
-        elif tag == "open":
+        elif tag in ("open", "open_unpriced"):
             opens.append(item)
-        elif tag == "open_unpriced":
-            opens.append({**item, "mult": None, "ret": None})
         else:
-            unpriced.append(item)
+            unpriced += 1
 
     n = len(priced)
-    scaled = [(p["ret"] or 0.0) * p["size"] for p in priced]
-    wins = [s for s in scaled if s > 0]
-    losses = [s for s in scaled if s <= 0]
+    wins = [p["ret"] for p in priced if (p["ret"] or 0) > 0]
+    losses = [p["ret"] for p in priced if (p["ret"] or 0) <= 0]
     win_rate = (len(wins) / n * 100.0) if n else 0.0
     avg_win, avg_loss = mean(wins), mean(losses)
     expectancy = (win_rate / 100.0 * avg_win) + ((100.0 - win_rate) / 100.0 * avg_loss) if n else 0.0
@@ -190,28 +191,38 @@ def main() -> None:
 
     rules = {}
     for p in priced:
-        rules.setdefault(p["reason"] or "unknown", []).append((p["ret"] or 0.0) * p["size"])
+        rules.setdefault(p["reason"] or "unknown", []).append(p["ret"] or 0.0)
 
-    lines = ["📊 <b>PAPER-TRADE REPORT v5 (SIZE-WEIGHTED)</b>"]
-    lines.append(f"🗂 Alerts: {alerts} | Tracked: {len(rows)} | Priced trades: {n} | Cancelled entries: {cancels}")
-    lines.append(f"🧲 Convergence gate: {gated_full} full-size / {gated_half} half-size")
+    lines = ["📊 <b>INTRADAY REPORT v7 (2x/3x ladder)</b>"]
+    lines.append(f"🗂 Alerts(all-time): {alerts} | Legacy excluded: {legacy_excluded} | Priced: {n}")
     lines.append(f"🎯 Win rate: <b>{win_rate:.1f}%</b> ({len(wins)}W / {len(losses)}L)")
-    lines.append(f"📈 Avg win: <b>{avg_win:+.1f}%</b> | 📉 Avg loss: <b>{avg_loss:+.1f}%</b> (size-weighted)")
+    lines.append(f"📈 Avg win: <b>{avg_win:+.1f}%</b> | 📉 Avg loss: <b>{avg_loss:+.1f}%</b>")
     lines.append(f"🧮 Expectancy / trade: <b>{expectancy:+.2f}%</b>")
     pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
-    lines.append(f"⚖️ Profit factor: <b>{pf_txt}</b>")
+    lines.append(f"⚖️ Profit factor: <b>{pf_txt}</b> (target ≥ {GREEN_PF})")
     lines.append(f"🏔 Avg MFE: <b>{mean([p['mfe'] for p in priced]):+.1f}%</b>")
     lines.append("")
-    lines.append("🧰 <b>Rule breakdown</b> (size-weighted avg):")
+    lines.append("🧰 <b>Exit rule breakdown</b>:")
     if rules:
         for key, vals in sorted(rules.items(), key=lambda kv: mean(kv[1]), reverse=True):
             lines.append(f"   • {key}: n={len(vals)} | avg {mean(vals):+.1f}%")
     else:
-        lines.append("   • (no priced closes yet)")
+        lines.append("   • (no priced closes yet in this cohort)")
+
+    tp1_trades = [p for p in priced if p["tp1_hit"]]
+    lines.append("")
+    lines.append("🧪 <b>STOP-WIDTH SENSITIVITY (whipsaw tax on TP1 winners):</b>")
+    if tp1_trades:
+        for s in CANDIDATE_STOPS:
+            killed = sum(1 for p in tp1_trades
+                         if p["mae"] > 0 and p["mae"] <= p["entry"] * (1.0 - s))
+            pct = killed / len(tp1_trades) * 100.0
+            lines.append(f"   • Stop -{s * 100:.0f}%: kills {killed}/{len(tp1_trades)} winners ({pct:.0f}%)")
+    else:
+        lines.append("   • (no TP1 winners in cohort yet - keep collecting)")
+
     if unpriced:
-        lines.append(f"⚠️ Unpriced legacy closes: {len(unpriced)}")
-    if bad:
-        lines.append(f"🗑 Bad entry rows: {bad}")
+        lines.append(f"⚠️ Unpriced closes in cohort: {unpriced}")
     if opens:
         live_open = [o for o in opens if o["mult"] is not None]
         lines.append(f"🔓 Open: {len(opens)}" + (f" | avg live {mean([o['mult'] for o in live_open]):.2f}x" if live_open else ""))
@@ -219,11 +230,11 @@ def main() -> None:
             lines.append(f"   • {o['symbol']}: " + (f"{o['mult']:.2f}x" if o["mult"] is not None else "n/a"))
     lines.append("")
     if n < MIN_SAMPLE:
-        verdict = f"⏳ SAMPLE TOO SMALL ({n}/{MIN_SAMPLE}). Keep collecting."
+        verdict = f"⏳ COHORT TOO SMALL ({n}/{MIN_SAMPLE}). Keep collecting."
     elif expectancy > 0 and (pf == float("inf") or pf >= GREEN_PF):
-        verdict = "🟢 GREEN-LIGHT CANDIDATE. Review rule breakdown, then size small."
+        verdict = "🟢 GREEN-LIGHT: PF ≥ 2.0 with positive expectancy."
     elif expectancy > 0:
-        verdict = "🟡 MARGINAL: positive expectancy, weak PF. Keep tuning."
+        verdict = "🟡 MARGINAL: positive expectancy, PF below 2.0. Compress losses further."
     else:
         verdict = "🔴 NEGATIVE EXPECTANCY: do NOT go live."
     lines.append(f"<b>{verdict}</b>")
