@@ -1,20 +1,7 @@
 """
 📈 Paper-Trade Performance Reporter (performance_report.py)
 Reads solana_breakout.db and computes the statistics that decide whether
-the breakout strategy goes live:
-
-  - Win rate, avg win / avg loss (ladder-weighted strategy returns)
-  - Expectancy per trade = (Win% x AvgWin) + (Loss% x AvgLoss[negative])
-  - Profit factor = gross profits / gross losses
-  - MFE (best peak) and rule-by-rule breakdown
-  - Live mark-to-market for open positions
-
-Exit pricing (documented, never guessed):
-  exact        -> tp_tracker stored exit_mcap > 0
-  reconstructed-> legacy rows: trailing = peak x 0.70, hard stop = 0.60x,
-                   liquidity gone = 0
-  unpriced     -> legacy time_decay / max_age closes (reported separately)
-Run via Actions -> performance-report -> Run workflow (read-only).
+the breakout strategy goes live.
 """
 
 import os
@@ -28,35 +15,27 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
-# Ladder tranches: (flag name, fraction of initial size, exit multiple)
-TRANCHES = (("tp1", 0.5, 2.0), ("tp2", 0.1, 3.0), ("tp3", 0.1, 5.0), ("tp4", 0.1, 10.0))
-TRAIL_KEEP = 0.70   # trailing stop fires at peak x 0.70
-HARD_KEEP = 0.60    # hard stop fires at entry x 0.60
-MIN_SAMPLE = 20     # trades needed before a GREEN LIGHT verdict
-GREEN_PF = 1.3      # minimum profit factor for a green light
-
+TRANCHES = (("tp1", 0.3, 2.0), ("tp2", 0.2, 3.0), ("tp3", 0.2, 5.0), ("tp4", 0.1, 10.0))
+TRAIL_KEEP = 0.75   
+HARD_KEEP = 0.75    # 🚨 Updated to match v4.1 Circuit Breaker (-25%)
+MIN_SAMPLE = 20     
+GREEN_PF = 1.3      
 
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
 
-
 def col(row, name, default):
-    try:
-        value = row[name]
-    except (IndexError, KeyError):
-        return default
+    try: value = row[name]
+    except (IndexError, KeyError): return default
     return default if value is None else value
-
 
 def mean(values):
     values = [v for v in values if isinstance(v, (int, float))]
     return (sum(values) / len(values)) if values else 0.0
 
-
 def send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -64,9 +43,8 @@ def send_telegram(text: str) -> None:
                   "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
-    except requests.exceptions.RequestException as exc:
-        log(f"⚠️ Telegram notify failed (non-fatal): {exc}")
-
+    except Exception as exc:
+        log(f"⚠️ Telegram notify failed: {exc}")
 
 def fetch_live_mcaps(addresses: list) -> dict:
     out = {}
@@ -74,37 +52,23 @@ def fetch_live_mcaps(addresses: list) -> dict:
         batch = addresses[i:i + 30]
         try:
             resp = requests.get(TOKENS_URL + ",".join(batch), timeout=15)
-            if resp.status_code == 429:
-                log("⚠️ DexScreener 429 during live valuation.")
-                time.sleep(2)
-                continue
+            if resp.status_code == 429: time.sleep(2); continue
             resp.raise_for_status()
             data = resp.json()
-        except Exception as exc:
-            log(f"⚠️ Live valuation fetch failed: {exc}")
-            time.sleep(1)
-            continue
+        except Exception: time.sleep(1); continue
         pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        if not isinstance(pairs, list):
-            continue
+        if not isinstance(pairs, list): continue
         for p in pairs:
-            if not isinstance(p, dict):
-                continue
+            if not isinstance(p, dict): continue
             token = (p.get("baseToken") or {}).get("address") or ""
             mcap = p.get("marketCap") or p.get("fdv") or 0
-            try:
-                mcap = float(mcap)
-            except (TypeError, ValueError):
-                continue
-            if token and mcap > 0 and (token not in out or mcap > out[token]):
-                out[token] = mcap
+            try: mcap = float(mcap)
+            except: continue
+            if token and mcap > 0 and (token not in out or mcap > out[token]): out[token] = mcap
         time.sleep(1)
     return out
 
-
 def strategy_return_pct(exit_mult, flags: dict) -> float:
-    """Ladder-weighted return: locked tranches at their multiples,
-    remainder at the final exit multiple."""
     ret = 0.0
     used = 0.0
     for name, weight, mult in TRANCHES:
@@ -115,29 +79,21 @@ def strategy_return_pct(exit_mult, flags: dict) -> float:
     ret += remainder * (exit_mult - 1.0) * 100.0
     return ret
 
-
 def price_exit(row, entry: float, peak: float, live_map: dict):
-    """Returns (exit_multiple, pricing_tag) or (None, tag)."""
     closed = int(col(row, "closed", 0) or 0)
     reason = str(col(row, "close_reason", "") or "")
     exit_mcap = float(col(row, "exit_mcap", 0) or 0)
 
     if closed == 0:
         live = live_map.get(row["token_address"])
-        if live is None or live <= 0 or entry <= 0:
-            return None, "open_unpriced"
+        if live is None or live <= 0 or entry <= 0: return None, "open_unpriced"
         return live / entry, "open"
 
-    if exit_mcap > 0 and entry > 0:
-        return exit_mcap / entry, "exact"
-    if reason == "trailing_stop" and peak > 0 and entry > 0:
-        return (peak * TRAIL_KEEP) / entry, "reconstructed"
-    if reason == "hard_stop":
-        return HARD_KEEP, "reconstructed"
-    if reason == "liquidity_gone":
-        return 0.0, "reconstructed"
+    if exit_mcap > 0 and entry > 0: return exit_mcap / entry, "exact"
+    if reason == "trailing_stop" and peak > 0 and entry > 0: return (peak * TRAIL_KEEP) / entry, "reconstructed"
+    if reason == "hard_stop": return HARD_KEEP, "reconstructed"
+    if reason == "liquidity_gone": return 0.0, "reconstructed"
     return None, "unpriced_legacy"
-
 
 def main() -> None:
     log("📈 Performance Reporter starting...")
@@ -147,11 +103,8 @@ def main() -> None:
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    if not all(
-        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
-        for t in ("tp_state", "alerted_tokens")
-    ):
-        log("❌ Required tables missing. Nothing to report.")
+    if not all(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone() for t in ("tp_state", "alerted_tokens")):
+        log("❌ Required tables missing.")
         conn.close()
         return
 
@@ -167,27 +120,13 @@ def main() -> None:
         entry = float(col(r, "entry_mcap", 0) or 0)
         peak = float(col(r, "peak_mcap", 0) or 0)
         flags = {name: col(r, name, 0) for name, _, _ in TRANCHES}
-        if entry <= 0:
-            bad += 1
-            continue
+        if entry <= 0: bad += 1; continue
         mult, tag = price_exit(r, entry, peak, live_map)
-        item = {
-            "symbol": col(r, "symbol", "?"),
-            "reason": str(col(r, "close_reason", "") or ""),
-            "ret": strategy_return_pct(mult, flags) if mult is not None else None,
-            "mfe": ((peak - entry) / entry) * 100.0 if peak > 0 else 0.0,
-            "mult": mult,
-            "flags": flags,
-        }
-        if tag in ("exact", "reconstructed"):
-            item["pricing"] = tag
-            priced.append(item)
-        elif tag == "open":
-            opens.append(item)
-        elif tag == "open_unpriced":
-            opens.append({**item, "mult": None, "ret": None})
-        else:
-            unpriced.append(item)
+        item = {"symbol": col(r, "symbol", "?"), "reason": str(col(r, "close_reason", "") or ""), "ret": strategy_return_pct(mult, flags) if mult is not None else None, "mfe": ((peak - entry) / entry) * 100.0 if peak > 0 else 0.0, "mult": mult, "flags": flags}
+        if tag in ("exact", "reconstructed"): item["pricing"] = tag; priced.append(item)
+        elif tag == "open": opens.append(item)
+        elif tag == "open_unpriced": opens.append({**item, "mult": None, "ret": None})
+        else: unpriced.append(item)
 
     n = len(priced)
     wins = [p for p in priced if (p["ret"] or 0) > 0]
@@ -206,7 +145,7 @@ def main() -> None:
         rules.setdefault(key, []).append(p["ret"] or 0.0)
 
     lines = []
-    lines.append("📊 <b>PAPER-TRADE PERFORMANCE REPORT</b>")
+    lines.append("📊 <b>PAPER-TRADE PERFORMANCE REPORT (CIRCUIT BREAKER)</b>")
     lines.append(f"🗂 Alerts: {alerts} | Tracked: {len(rows)} | Priced trades: {n}")
     lines.append(f"🎯 Win rate: <b>{win_rate:.1f}%</b> ({len(wins)}W / {len(losses)}L)")
     lines.append(f"📈 Avg win: <b>{avg_win:+.1f}%</b> | 📉 Avg loss: <b>{avg_loss:+.1f}%</b>")
@@ -223,34 +162,26 @@ def main() -> None:
         lines.append("   • (no priced closes yet)")
     if unpriced:
         reasons = {}
-        for u in unpriced:
-            reasons[u["reason"] or "unknown"] = reasons.get(u["reason"] or "unknown", 0) + 1
-        lines.append(f"⚠️ Unpriced legacy closes (excluded, not guessed): {len(unpriced)} {reasons}")
-    if bad:
-        lines.append(f"🗑 Rows with bad entry data: {bad}")
+        for u in unpriced: reasons[u["reason"] or "unknown"] = reasons.get(u["reason"] or "unknown", 0) + 1
+        lines.append(f"⚠️ Unpriced legacy closes: {len(unpriced)} {reasons}")
+    if bad: lines.append(f"🗑 Rows with bad entry data: {bad}")
     if opens:
         live_open = [o for o in opens if o["mult"] is not None]
-        lines.append(f"🔓 Open positions: {len(opens)}" +
-                     (f" | avg live {mean([o['mult'] for o in live_open]):.2f}x" if live_open else ""))
+        lines.append(f"🔓 Open positions: {len(opens)}" + (f" | avg live {mean([o['mult'] for o in live_open]):.2f}x" if live_open else ""))
         for o in opens[:6]:
             mtxt = f"{o['mult']:.2f}x" if o["mult"] is not None else "n/a"
             lines.append(f"   • {o['symbol']}: {mtxt}")
     lines.append("")
-    if n < MIN_SAMPLE:
-        verdict = f"⏳ SAMPLE TOO SMALL ({n}/{MIN_SAMPLE}). Keep collecting."
-    elif expectancy > 0 and (pf == float("inf") or pf >= GREEN_PF):
-        verdict = "🟢 GREEN-LIGHT CANDIDATE: positive expectancy & solid PF. Review rule breakdown, then size small."
-    elif expectancy > 0:
-        verdict = "🟡 MARGINAL: positive expectancy but weak profit factor. Tune filters before live size."
-    else:
-        verdict = "🔴 NEGATIVE EXPECTANCY: do NOT go live. Tune discovery filters / exit rules first."
+    if n < MIN_SAMPLE: verdict = f"⏳ SAMPLE TOO SMALL ({n}/{MIN_SAMPLE}). Keep collecting."
+    elif expectancy > 0 and (pf == float("inf") or pf >= GREEN_PF): verdict = "🟢 GREEN-LIGHT CANDIDATE: positive expectancy & solid PF. Review rule breakdown, then size small."
+    elif expectancy > 0: verdict = "🟡 MARGINAL: positive expectancy but weak profit factor. Tune filters before live size."
+    else: verdict = "🔴 NEGATIVE EXPECTANCY: do NOT go live. Tune discovery filters / exit rules first."
     lines.append(f"<b>{verdict}</b>")
 
     report = "\n".join(lines)
     print("\n" + report.replace("<b>", "").replace("</b>", "") + "\n")
     send_telegram(report)
     log("✅ Report complete.")
-
 
 if __name__ == "__main__":
     main()
