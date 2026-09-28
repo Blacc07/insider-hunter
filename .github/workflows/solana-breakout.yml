@@ -1,7 +1,7 @@
 name: solana-breakout
 
 on:
-  workflow_dispatch:   # driven by the cron-job.org Solana heartbeat every 5 minutes
+  workflow_dispatch:   # cron-job.org heartbeat #1 every 5 minutes
 
 permissions:
   contents: write
@@ -25,13 +25,14 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run Solana Breakout (Discovery)
+      - name: Run Solana Breakout (Discovery v5)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
         run: python solana_breakout.py
 
-      - name: Run Cloud Take-Profit Tracker (4 Rules)
+      - name: Run Cloud Take-Profit Tracker (v5)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
