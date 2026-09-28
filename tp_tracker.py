@@ -1,10 +1,7 @@
 """
-💼 Cloud Take-Profit Tracker v3 (tp_tracker.py)
-v3 CHANGE: records exit_mcap + closed_ts on every closed position so the
-Performance Reporter can compute exact P&L (no reconstruction needed).
-Rules unchanged: TP1 2x (sell 50%), ladder 3x/5x/10x (10% each),
-trailing stop -30% from peak after TP1, hard stop -40% before TP1,
-time decay 2h flat, max age 24h, hourly status update.
+💼 Cloud Take-Profit Tracker v4.1 (tp_tracker.py) - CIRCUIT BREAKER
+v4.1 UPGRADE: Tightened Hard Stop from -40% to -25% to account for 
+5-minute polling latency slippage. Cuts losers faster to save capital.
 """
 
 import os
@@ -18,47 +15,40 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
-TP1_MULT = 2.0
-TP2_MULT = 3.0
-TP3_MULT = 5.0
-TP4_MULT = 10.0
-TRAILING_DROP = 0.30
+TP1_MULT = 2.0   
+TP2_MULT = 3.0   
+TP3_MULT = 5.0   
+TP4_MULT = 10.0  
+
+TRAIL_TIGHT = 0.25  
+TRAIL_WIDE = 0.40   
+HARD_STOP_DROP = 0.25  # 🚨 CIRCUIT BREAKER: Tightened from 0.40 to 0.25
 TIME_DECAY_HOURS = 2.0
-HARD_STOP_DROP = 0.40
 MAX_AGE_HOURS = 24.0
 BATCH_LIMIT = 30
-
 
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)
 
-
 def parse_iso(value, fallback: datetime) -> datetime:
-    if not value:
-        return fallback
+    if not value: return fallback
     try:
         dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
         return dt
-    except ValueError:
-        return fallback
-
+    except ValueError: return fallback
 
 def send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
     except requests.exceptions.RequestException as exc:
         log(f"⚠️ Telegram notify failed (non-fatal): {exc}")
-
 
 def send_all(messages: list) -> int:
     sent = 0
@@ -68,11 +58,9 @@ def send_all(messages: list) -> int:
         time.sleep(1)
     return sent
 
-
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
     return cur.fetchone() is not None
-
 
 def init_tp_table(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -99,21 +87,15 @@ def init_tp_table(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-
 def ensure_columns(conn: sqlite3.Connection) -> None:
     if not table_exists(conn, "tp_state"):
         init_tp_table(conn)
         return
     cols = [row[1] for row in conn.execute("PRAGMA table_info(tp_state)").fetchall()]
-    for name, ddl in (
-        ("last_status_ts", "TEXT DEFAULT ''"),
-        ("exit_mcap", "REAL DEFAULT 0"),
-        ("closed_ts", "TEXT DEFAULT ''"),
-    ):
+    for name, ddl in (("last_status_ts", "TEXT DEFAULT ''"), ("exit_mcap", "REAL DEFAULT 0"), ("closed_ts", "TEXT DEFAULT ''")):
         if name not in cols:
             conn.execute(f"ALTER TABLE tp_state ADD COLUMN {name} {ddl}")
     conn.commit()
-
 
 def seed_new_positions(conn: sqlite3.Connection) -> int:
     cur = conn.execute(
@@ -124,10 +106,8 @@ def seed_new_positions(conn: sqlite3.Connection) -> int:
     now_iso = datetime.now(timezone.utc).isoformat()
     n = 0
     for pair, symbol, token, first_alerted, mcap in cur.fetchall():
-        try:
-            entry = float(mcap or 0.0)
-        except (TypeError, ValueError):
-            entry = 0.0
+        try: entry = float(mcap or 0.0)
+        except (TypeError, ValueError): entry = 0.0
         ts = first_alerted or now_iso
         conn.execute(
             "INSERT OR IGNORE INTO tp_state (token_address, symbol, pair_address, "
@@ -140,10 +120,8 @@ def seed_new_positions(conn: sqlite3.Connection) -> int:
     conn.commit()
     return n
 
-
 def fetch_mcaps(addresses: list):
-    if not addresses:
-        return True, {}
+    if not addresses: return True, {}
     batch = addresses[:BATCH_LIMIT]
     try:
         resp = requests.get(TOKENS_URL + ",".join(batch), timeout=15)
@@ -152,36 +130,24 @@ def fetch_mcaps(addresses: list):
             return False, {}
         resp.raise_for_status()
         data = resp.json()
-    except requests.exceptions.RequestException as exc:
-        log(f"⚠️ DexScreener network error: {exc}")
-        return False, {}
-    except ValueError as exc:
-        log(f"⚠️ DexScreener bad JSON: {exc}")
+    except Exception as exc:
+        log(f"⚠️ DexScreener error: {exc}")
         return False, {}
 
     pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else None)
-    if not isinstance(pairs, list):
-        log("⚠️ Unexpected DexScreener payload - skipping cycle.")
-        return False, {}
+    if not isinstance(pairs, list): return False, {}
 
     mcap_map = {}
     for p in pairs:
-        if not isinstance(p, dict):
-            continue
+        if not isinstance(p, dict): continue
         token = (p.get("baseToken") or {}).get("address") or ""
         liq = (p.get("liquidity") or {}).get("usd") or 0
         mcap = p.get("marketCap") or p.get("fdv") or 0
-        try:
-            liq = float(liq)
-            mcap = float(mcap)
-        except (TypeError, ValueError):
-            continue
-        if not token or mcap <= 0 or liq <= 0:
-            continue
-        if token not in mcap_map or mcap > mcap_map[token]:
-            mcap_map[token] = mcap
+        try: liq, mcap = float(liq), float(mcap)
+        except: continue
+        if not token or mcap <= 0 or liq <= 0: continue
+        if token not in mcap_map or mcap > mcap_map[token]: mcap_map[token] = mcap
     return True, mcap_map
-
 
 def build_message(emoji, title, symbol, entry, peak, current, action, pair) -> str:
     mult = (current / entry) if (entry > 0 and current > 0) else 0.0
@@ -194,10 +160,8 @@ def build_message(emoji, title, symbol, entry, peak, current, action, pair) -> s
         f"🏔 Peak MCap: ${peak:,.0f} ({peak_mult:.2f}x)",
         f"📋 <b>STATUS:</b> {action}",
     ]
-    if pair:
-        lines.append(f"🔗 <a href='https://dexscreener.com/solana/{pair}'>View Chart</a>")
+    if pair: lines.append(f"🔗 <a href='https://dexscreener.com/solana/{pair}'>View Chart</a>")
     return "\n".join(lines)
-
 
 def evaluate_position(conn: sqlite3.Connection, r, now: datetime, mcap_map: dict) -> int:
     token = r[0]
@@ -221,8 +185,7 @@ def evaluate_position(conn: sqlite3.Connection, r, now: datetime, mcap_map: dict
         closed, reason, exit_mcap = 1, "bad_entry", 0.0
         closed_ts = now.isoformat()
     elif current is None or current <= 0:
-        msgs.append(build_message("🕳️", "LIQUIDITY VANISHED", symbol, entry, peak, 0.0,
-                                  "SELL REMAINDER IF POSSIBLE - pair no longer priced (likely rug).", pair))
+        msgs.append(build_message("🕳️", "LIQUIDITY VANISHED", symbol, entry, peak, 0.0, "SELL REMAINDER IF POSSIBLE.", pair))
         closed, reason, exit_mcap = 1, "liquidity_gone", 0.0
         closed_ts = now.isoformat()
     else:
@@ -233,71 +196,63 @@ def evaluate_position(conn: sqlite3.Connection, r, now: datetime, mcap_map: dict
 
         if tp1 == 0 and mult >= TP1_MULT:
             tp1 = 1
-            msgs.append(build_message("1️⃣", "TP1 - PRINCIPAL RECOVERED", symbol, entry, peak, current,
-                                      "SELL 50% of position - initial investment is back.", pair))
+            msgs.append(build_message("1️⃣", "TP1 - CAPITAL RECOVERED (2x)", symbol, entry, peak, current, "SELL 30% of position. 70% Moonbag riding.", pair))
         if tp1 == 1 and tp2 == 0 and mult >= TP2_MULT:
             tp2 = 1
-            msgs.append(build_message("2️⃣", "TP2 - 3x LADDER", symbol, entry, peak, current,
-                                      "SELL 10% of INITIAL size.", pair))
+            msgs.append(build_message("2️⃣", "TP2 - 3x LADDER", symbol, entry, peak, current, "SELL 20% of INITIAL size.", pair))
         if tp1 == 1 and tp3 == 0 and mult >= TP3_MULT:
             tp3 = 1
-            msgs.append(build_message("3️⃣", "TP3 - 5x LADDER", symbol, entry, peak, current,
-                                      "SELL 10% of INITIAL size.", pair))
+            msgs.append(build_message("3️⃣", "TP3 - 5x LADDER", symbol, entry, peak, current, "SELL 20% of INITIAL size.", pair))
         if tp1 == 1 and tp4 == 0 and mult >= TP4_MULT:
             tp4 = 1
-            msgs.append(build_message("4️⃣", "TP4 - 10x LADDER", symbol, entry, peak, current,
-                                      "SELL 10% of INITIAL size.", pair))
+            msgs.append(build_message("4️⃣", "TP4 - 10x LADDER", symbol, entry, peak, current, "SELL 10% of INITIAL size.", pair))
 
         if closed == 0 and tp1 == 1 and peak > 0:
+            trail_threshold = TRAIL_WIDE if mult >= 3.0 else TRAIL_TIGHT
             drop = (peak - current) / peak
-            if drop >= TRAILING_DROP:
+            if drop >= trail_threshold:
                 closed, reason, exit_mcap = 1, "trailing_stop", current
                 closed_ts = now.isoformat()
-                msgs.append(build_message("🛑", "TRAILING STOP HIT", symbol, entry, peak, current,
-                                          f"SELL REMAINDER - price dropped {drop * 100:.0f}% from peak.", pair))
+                trail_pct = int(trail_threshold * 100)
+                msgs.append(build_message("🛑", f"TRAILING STOP HIT (-{trail_pct}%)", symbol, entry, peak, current, f"SELL REMAINDER.", pair))
 
+        # ⛔ CIRCUIT BREAKER HARD STOP
         if closed == 0 and tp1 == 0 and HARD_STOP_DROP > 0:
             loss = (entry - current) / entry
             if loss >= HARD_STOP_DROP:
                 closed, reason, exit_mcap = 1, "hard_stop", current
                 closed_ts = now.isoformat()
-                msgs.append(build_message("⛔", "HARD STOP-LOSS", symbol, entry, peak, current,
-                                          f"SELL EVERYTHING - down {loss * 100:.0f}% from entry.", pair))
+                msgs.append(build_message("⛔", "CIRCUIT BREAKER STOP", symbol, entry, peak, current, f"SELL EVERYTHING - down {loss * 100:.0f}% from entry.", pair))
 
         if closed == 0:
             flat_h = (now - last_peak_dt).total_seconds() / 3600.0
             if flat_h >= TIME_DECAY_HOURS:
                 closed, reason, exit_mcap = 1, "time_decay", current
                 closed_ts = now.isoformat()
-                msgs.append(build_message("⏳", "TIME DECAY - MOMENTUM DEAD", symbol, entry, peak, current,
-                                          f"SELL REMAINDER - no new peak for {flat_h:.1f}h.", pair))
+                msgs.append(build_message("⏳", "TIME DECAY", symbol, entry, peak, current, f"SELL REMAINDER - no new peak for {flat_h:.1f}h.", pair))
 
         age_h = (now - started_dt).total_seconds() / 3600.0
         if closed == 0 and age_h >= MAX_AGE_HOURS:
             closed, reason, exit_mcap = 1, "max_age", current
             closed_ts = now.isoformat()
-            msgs.append(build_message("🏁", "MAX TRACKING AGE (24h)", symbol, entry, peak, current,
-                                      "Tracking stopped - manage any remainder manually.", pair))
+            msgs.append(build_message("🏁", "MAX AGE (24h)", symbol, entry, peak, current, "Tracking stopped.", pair))
 
         if closed == 0:
             status_age_h = (now - last_status_dt).total_seconds() / 3600.0
             if status_age_h >= 1.0:
-                msgs.append(build_message("📊", "HOURLY STATUS UPDATE", symbol, entry, peak, current,
-                                          f"Holding... Current: {mult:.2f}x | Peak: {(peak / entry):.2f}x", pair))
+                msgs.append(build_message("📊", "HOURLY STATUS", symbol, entry, peak, current, f"Holding... Current: {mult:.2f}x | Peak: {(peak / entry):.2f}x", pair))
                 last_status_dt = now
 
     conn.execute(
         "UPDATE tp_state SET peak_mcap=?, last_peak_ts=?, tp1=?, tp2=?, tp3=?, tp4=?, "
         "closed=?, close_reason=?, last_status_ts=?, exit_mcap=?, closed_ts=? WHERE token_address=?",
-        (peak, last_peak_dt.isoformat(), tp1, tp2, tp3, tp4, closed, reason,
-         last_status_dt.isoformat(), exit_mcap, closed_ts, token),
+        (peak, last_peak_dt.isoformat(), tp1, tp2, tp3, tp4, closed, reason, last_status_dt.isoformat(), exit_mcap, closed_ts, token),
     )
     conn.commit()
     return send_all(msgs)
 
-
 def main() -> None:
-    log("💼 Cloud Take-Profit Tracker v3 starting...")
+    log("💼 Cloud Take-Profit Tracker v4.1 (Circuit Breaker) starting...")
     if not os.path.exists(DB_PATH):
         log("⚠️ DB not found yet. Exiting safely.")
         return
@@ -311,8 +266,7 @@ def main() -> None:
         return
 
     seeded = seed_new_positions(conn)
-    if seeded:
-        log(f"🌱 Seeded {seeded} new position(s) from breakout alerts.")
+    if seeded: log(f"🌱 Seeded {seeded} new position(s).")
 
     rows = conn.execute(
         "SELECT token_address, symbol, pair_address, entry_mcap, peak_mcap, "
@@ -321,14 +275,14 @@ def main() -> None:
     ).fetchall()
 
     if not rows:
-        log("🔍 No open positions. Sleeping until next cycle.")
+        log("🔍 No open positions. Sleeping.")
         conn.close()
         return
 
     log(f"📡 Watching {len(rows)} open position(s)...")
     ok, mcap_map = fetch_mcaps([r[0] for r in rows])
     if not ok:
-        log("⚠️ DexScreener fetch failed - skipping cycle, positions untouched.")
+        log("⚠️ DexScreener fetch failed - skipping cycle.")
         conn.close()
         return
 
@@ -339,7 +293,6 @@ def main() -> None:
 
     conn.close()
     log(f"✅ TP Tracker complete. {sent} Telegram alert(s) fired.")
-
 
 if __name__ == "__main__":
     main()
