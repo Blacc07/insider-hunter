@@ -1,36 +1,30 @@
 """
-💼 Cloud Take-Profit Tracker v5 (tp_tracker.py)
-v5 UPGRADE (Phase 7):
-  1. PENDING entries: positions seed as limit orders at -10% of alert mcap,
-     valid 15 minutes. No fill = cancelled (never counted as a trade).
-  2. PROVE-IT STOP: if not >= +25% within 45 minutes of fill, close at market.
-  3. CONVERGENCE GATE: full size (1.0) only if the mint appears in Phase 6
-     convergence_events (72h); otherwise half size (0.5).
-  4. Circuit breaker hard stop -25%, dynamic trailing (-25% / -40% above 3x).
+💼 Exit Engine (tp_tracker.py) — v7.1
+Ladder: TP1 2x (30%), TP2 3x (20%), TP3 5x (20%), TP4 10x (10%).
+v7.1 CHANGE: remainder trailing stop is now a FLAT -25% from peak mcap at
+ALL multiples (the -40% widening above 3x is removed). Locks profits harder
+on runners, consistent with the intraday mandate.
+Risk rules: hard stop -20% pre-TP1, stall stop 60min <1.2x, max age 12h.
+MAE (pre-TP1 trough) logging retained for stop-width sensitivity reports.
 """
 
 import os
 import sqlite3
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.environ.get("DB_PATH", "solana_breakout.db")
-SMART_MONEY_DB = os.environ.get("SMART_MONEY_DB", "solana_smart_money.db")
 TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
 TP1_MULT, TP2_MULT, TP3_MULT, TP4_MULT = 2.0, 3.0, 5.0, 10.0
-TRAIL_TIGHT, TRAIL_WIDE = 0.25, 0.40
-HARD_STOP_DROP = 0.25
-PROVE_IT_MULT = 1.25
-PROVE_IT_MINUTES = 45
-PULLBACK_PCT = 0.10
-ENTRY_WINDOW_MIN = 15
-GATE_WINDOW_H = 72
-TIME_DECAY_HOURS = 2.0
-MAX_AGE_HOURS = 24.0
+TRAIL_DROP = 0.25          # 🛑 FLAT: -25% from peak mcap at every multiple
+HARD_STOP_DROP = 0.20
+STALL_MINUTES = 60
+STALL_MIN_MULT = 1.20
+MAX_AGE_HOURS = 12
 BATCH_LIMIT = 30
 
 
@@ -98,7 +92,8 @@ def init_tp_table(conn) -> None:
             entry_status TEXT DEFAULT 'active',
             limit_mcap REAL DEFAULT 0,
             entry_deadline TEXT DEFAULT '',
-            size_mult REAL DEFAULT 1.0
+            size_mult REAL DEFAULT 1.0,
+            mae_mcap REAL DEFAULT 0
         )
         """
     )
@@ -114,30 +109,11 @@ def ensure_columns(conn) -> None:
         ("last_status_ts", "TEXT DEFAULT ''"), ("exit_mcap", "REAL DEFAULT 0"),
         ("closed_ts", "TEXT DEFAULT ''"), ("entry_status", "TEXT DEFAULT 'active'"),
         ("limit_mcap", "REAL DEFAULT 0"), ("entry_deadline", "TEXT DEFAULT ''"),
-        ("size_mult", "REAL DEFAULT 1.0"),
+        ("size_mult", "REAL DEFAULT 1.0"), ("mae_mcap", "REAL DEFAULT 0"),
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE tp_state ADD COLUMN {name} {ddl}")
     conn.commit()
-
-
-def convergence_gate(token: str) -> float:
-    if not os.path.exists(SMART_MONEY_DB):
-        return 0.5
-    try:
-        c2 = sqlite3.connect(f"file:{SMART_MONEY_DB}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return 0.5
-    try:
-        cutoff = int(time.time()) - GATE_WINDOW_H * 3600
-        row = c2.execute(
-            "SELECT 1 FROM convergence_events WHERE mint=? AND ts>=? LIMIT 1", (token, cutoff)
-        ).fetchone()
-    except sqlite3.Error:
-        row = None
-    finally:
-        c2.close()
-    return 1.0 if row else 0.5
 
 
 def seed_new_positions(conn) -> int:
@@ -146,24 +122,21 @@ def seed_new_positions(conn) -> int:
         "FROM alerted_tokens WHERE token_address IS NOT NULL AND token_address != '' "
         "AND token_address NOT IN (SELECT token_address FROM tp_state)"
     )
-    now = datetime.now(timezone.utc)
+    now_iso = datetime.now(timezone.utc).isoformat()
     n = 0
     for pair, symbol, token, first_alerted, mcap in cur.fetchall():
         try:
             entry = float(mcap or 0.0)
         except (TypeError, ValueError):
             entry = 0.0
-        alert_dt = parse_iso(first_alerted, now)
-        limit = entry * (1.0 - PULLBACK_PCT) if entry > 0 else 0.0
-        deadline = (alert_dt + timedelta(minutes=ENTRY_WINDOW_MIN)).isoformat()
-        size = convergence_gate(token) if entry > 0 else 0.5
+        ts = first_alerted or now_iso
         conn.execute(
             "INSERT OR IGNORE INTO tp_state (token_address, symbol, pair_address, entry_mcap, "
             "peak_mcap, last_peak_ts, started_ts, tp1, tp2, tp3, tp4, closed, close_reason, "
-            "last_status_ts, exit_mcap, closed_ts, entry_status, limit_mcap, entry_deadline, size_mult) "
-            "VALUES (?, ?, ?, 0, 0, ?, ?, 0,0,0,0, 0, '', ?, 0, '', 'pending', ?, ?, ?)",
-            (token, symbol or "UNKNOWN", pair or "", alert_dt.isoformat(), alert_dt.isoformat(),
-             alert_dt.isoformat(), limit, deadline, size),
+            "last_status_ts, exit_mcap, closed_ts, entry_status, limit_mcap, entry_deadline, "
+            "size_mult, mae_mcap) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0,0,0,0, 0, '', ?, 0, '', 'active', 0, '', 1.0, ?)",
+            (token, symbol or "UNKNOWN", pair or "", entry, entry, ts, ts, ts, entry),
         )
         n += 1
     conn.commit()
@@ -211,13 +184,12 @@ def build_message(emoji, title, symbol, entry, peak, current, action, pair) -> s
     lines = [
         f"{emoji} <b>{title}</b> {emoji}",
         f"🪙 <b>{symbol}</b>",
-        f"💰 Entry MCap: ${entry:,.0f}",
-        f"📡 Current MCap: ${current:,.0f} ({mult:.2f}x)",
-        f"🏔 Peak MCap: ${peak:,.0f} ({peak_mult:.2f}x)",
-        f"📋 <b>STATUS:</b> {action}",
+        f"💰 Entry: ${entry:,.0f} | 📡 Now: ${current:,.0f} ({mult:.2f}x)",
+        f"🏔 Peak: ${peak:,.0f} ({peak_mult:.2f}x)",
+        f"📋 <b>ACTION:</b> {action}",
     ]
     if pair:
-        lines.append(f"🔗 <a href='https://dexscreener.com/solana/{pair}'>View Chart</a>")
+        lines.append(f"🔗 <a href='https://dexscreener.com/solana/{pair}'>Chart</a>")
     return "\n".join(lines)
 
 
@@ -229,125 +201,106 @@ def evaluate_position(conn, r, now: datetime, mcap_map: dict) -> int:
     started_dt = parse_iso(r[6], now)
     tp1, tp2, tp3, tp4 = r[7], r[8], r[9], r[10]
     last_status_dt = parse_iso(r[11], now)
-    entry_status = r[12] or "active"
-    limit_mcap = r[13] or 0.0
-    deadline_dt = parse_iso(r[14], now)
+    mae = r[12] or 0.0
 
     msgs = []
     closed, reason = 0, ""
     exit_mcap, closed_ts = 0.0, ""
     current = mcap_map.get(token)
 
-    # ---------- PENDING LIMIT ENTRY LOGIC ----------
-    if entry_status == "pending":
-        if current is not None and current > 0 and limit_mcap > 0 and current <= limit_mcap:
-            entry_status = "active"
-            entry, peak = limit_mcap, limit_mcap
-            started_dt, last_peak_dt, last_status_dt = now, now, now
-            msgs.append(build_message("🎯", "PULLBACK ENTRY FILLED", symbol, entry, peak, current,
-                                      f"Limit filled at -{PULLBACK_PCT * 100:.0f}% of alert price. Size x{r[15] or 1.0}.", pair))
-        elif now > deadline_dt:
-            entry_status = "cancelled"
-            closed, reason = 1, "entry_expired"
-            closed_ts = now.isoformat()
-            msgs.append(f"⏭️ <b>ENTRY SKIPPED</b> — {symbol}: no pullback fill within {ENTRY_WINDOW_MIN}min. No trade taken.")
-        else:
-            conn.execute(
-                "UPDATE tp_state SET entry_status=?, closed=?, close_reason=?, closed_ts=? WHERE token_address=?",
-                (entry_status, closed, reason, closed_ts, token))
-            conn.commit()
-            return send_all(msgs)
+    if entry <= 0:
+        closed, reason, exit_mcap = 1, "bad_entry", 0.0
+        closed_ts = now.isoformat()
+    elif current is None or current <= 0:
+        msgs.append(build_message("🕳️", "LIQUIDITY VANISHED", symbol, entry, peak, 0.0,
+                                  "EXIT NOW IF POSSIBLE - pair unpriced (likely rug).", pair))
+        closed, reason, exit_mcap = 1, "liquidity_gone", 0.0
+        closed_ts = now.isoformat()
+    else:
+        mult = current / entry
 
-    # ---------- ACTIVE POSITION RULES ----------
-    if entry_status == "active":
-        if entry <= 0:
-            closed, reason, exit_mcap = 1, "bad_entry", 0.0
-            closed_ts = now.isoformat()
-        elif current is None or current <= 0:
-            msgs.append(build_message("🕳️", "LIQUIDITY VANISHED", symbol, entry, peak, 0.0,
-                                      "SELL REMAINDER IF POSSIBLE.", pair))
-            closed, reason, exit_mcap = 1, "liquidity_gone", 0.0
-            closed_ts = now.isoformat()
-        else:
-            mult = current / entry
-            if current > peak:
-                peak, last_peak_dt = current, now
+        # 📉 MAE logging: pre-TP1 trough only (frozen once TP1 hits)
+        if tp1 == 0:
+            base = mae if mae > 0 else entry
+            mae = min(base, current)
 
-            if tp1 == 0 and mult >= TP1_MULT:
-                tp1 = 1
-                msgs.append(build_message("1️⃣", "TP1 - CAPITAL RECOVERED (2x)", symbol, entry, peak, current,
-                                          "SELL 30%. 70% moonbag riding.", pair))
-            if tp1 == 1 and tp2 == 0 and mult >= TP2_MULT:
-                tp2 = 1
-                msgs.append(build_message("2️⃣", "TP2 - 3x LADDER", symbol, entry, peak, current, "SELL 20% of INITIAL.", pair))
-            if tp1 == 1 and tp3 == 0 and mult >= TP3_MULT:
-                tp3 = 1
-                msgs.append(build_message("3️⃣", "TP3 - 5x LADDER", symbol, entry, peak, current, "SELL 20% of INITIAL.", pair))
-            if tp1 == 1 and tp4 == 0 and mult >= TP4_MULT:
-                tp4 = 1
-                msgs.append(build_message("4️⃣", "TP4 - 10x LADDER", symbol, entry, peak, current, "SELL 10% of INITIAL.", pair))
+        if current > peak:
+            peak, last_peak_dt = current, now
 
-            # ⏱️ PROVE-IT STOP
-            if closed == 0 and tp1 == 0:
-                age_min = (now - started_dt).total_seconds() / 60.0
-                if age_min >= PROVE_IT_MINUTES and mult < PROVE_IT_MULT:
-                    closed, reason, exit_mcap = 1, "prove_it", current
-                    closed_ts = now.isoformat()
-                    msgs.append(build_message("⏱️", "PROVE-IT STOP", symbol, entry, peak, current,
-                                              f"No strength in {age_min:.0f}min - closing at market.", pair))
+        # 🪜 LADDER
+        if tp1 == 0 and mult >= TP1_MULT:
+            tp1 = 1
+            msgs.append(build_message("1️⃣", "TP1 - 2x PRINCIPAL+", symbol, entry, peak, current,
+                                      "SELL 30%. Initial capital recovered; 70% rides.", pair))
+        if tp1 == 1 and tp2 == 0 and mult >= TP2_MULT:
+            tp2 = 1
+            msgs.append(build_message("2️⃣", "TP2 - 3x LADDER", symbol, entry, peak, current,
+                                      "SELL 20% of INITIAL size.", pair))
+        if tp1 == 1 and tp3 == 0 and mult >= TP3_MULT:
+            tp3 = 1
+            msgs.append(build_message("3️⃣", "TP3 - 5x LADDER", symbol, entry, peak, current,
+                                      "SELL 20% of INITIAL size.", pair))
+        if tp1 == 1 and tp4 == 0 and mult >= TP4_MULT:
+            tp4 = 1
+            msgs.append(build_message("4️⃣", "TP4 - 10x LADDER", symbol, entry, peak, current,
+                                      "SELL 10% of INITIAL size. 20% rides the -25% trail.", pair))
 
-            # 🛑 Dynamic trailing stop
-            if closed == 0 and tp1 == 1 and peak > 0:
-                trail = TRAIL_WIDE if mult >= 3.0 else TRAIL_TIGHT
-                drop = (peak - current) / peak
-                if drop >= trail:
-                    closed, reason, exit_mcap = 1, "trailing_stop", current
-                    closed_ts = now.isoformat()
-                    msgs.append(build_message("🛑", f"TRAILING STOP (-{int(trail * 100)}%)", symbol, entry, peak, current,
-                                              "SELL REMAINDER.", pair))
-
-            # ⛔ Circuit breaker
-            if closed == 0 and tp1 == 0 and HARD_STOP_DROP > 0:
-                loss = (entry - current) / entry
-                if loss >= HARD_STOP_DROP:
-                    closed, reason, exit_mcap = 1, "hard_stop", current
-                    closed_ts = now.isoformat()
-                    msgs.append(build_message("⛔", "CIRCUIT BREAKER STOP", symbol, entry, peak, current,
-                                              f"SELL EVERYTHING -{loss * 100:.0f}%.", pair))
-
-            # ⏳ Time decay / max age / hourly status
-            if closed == 0:
-                flat_h = (now - last_peak_dt).total_seconds() / 3600.0
-                if flat_h >= TIME_DECAY_HOURS:
-                    closed, reason, exit_mcap = 1, "time_decay", current
-                    closed_ts = now.isoformat()
-                    msgs.append(build_message("⏳", "TIME DECAY", symbol, entry, peak, current,
-                                              f"SELL REMAINDER - flat {flat_h:.1f}h.", pair))
-            age_h = (now - started_dt).total_seconds() / 3600.0
-            if closed == 0 and age_h >= MAX_AGE_HOURS:
-                closed, reason, exit_mcap = 1, "max_age", current
+        # 🛑 FLAT TRAILING STOP: -25% from peak mcap at every multiple
+        if closed == 0 and tp1 == 1 and peak > 0:
+            drop = (peak - current) / peak
+            if drop >= TRAIL_DROP:
+                closed, reason, exit_mcap = 1, "trailing_stop", current
                 closed_ts = now.isoformat()
-                msgs.append(build_message("🏁", "MAX AGE (24h)", symbol, entry, peak, current, "Tracking stopped.", pair))
-            if closed == 0:
-                status_age_h = (now - last_status_dt).total_seconds() / 3600.0
-                if status_age_h >= 1.0:
-                    msgs.append(build_message("📊", "HOURLY STATUS", symbol, entry, peak, current,
-                                              f"Holding {mult:.2f}x | Peak {(peak / entry):.2f}x", pair))
-                    last_status_dt = now
+                msgs.append(build_message("🛑", "TRAILING STOP (-25% from peak)",
+                                          symbol, entry, peak, current,
+                                          "SELL REMAINDER (20%).", pair))
+
+        # ⛔ Hard stop -20% (pre-TP1 only)
+        if closed == 0 and tp1 == 0:
+            loss = (entry - current) / entry
+            if loss >= HARD_STOP_DROP:
+                closed, reason, exit_mcap = 1, "hard_stop", current
+                closed_ts = now.isoformat()
+                msgs.append(build_message("⛔", "HARD STOP (-20%)", symbol, entry, peak, current,
+                                          "SELL EVERYTHING.", pair))
+
+        # ⏱️ Stall stop
+        if closed == 0 and tp1 == 0:
+            age_min = (now - started_dt).total_seconds() / 60.0
+            if age_min >= STALL_MINUTES and mult < STALL_MIN_MULT:
+                closed, reason, exit_mcap = 1, "stall_stop", current
+                closed_ts = now.isoformat()
+                msgs.append(build_message("⏱️", "STALL STOP (60min, no strength)", symbol, entry, peak, current,
+                                          "SELL EVERYTHING - momentum never arrived.", pair))
+
+        age_h = (now - started_dt).total_seconds() / 3600.0
+        if closed == 0 and age_h >= MAX_AGE_HOURS:
+            closed, reason, exit_mcap = 1, "max_age", current
+            closed_ts = now.isoformat()
+            msgs.append(build_message("🏁", "MAX AGE (12h)", symbol, entry, peak, current,
+                                      "Intraday window closed - exit remainder.", pair))
+
+        if closed == 0:
+            status_age_h = (now - last_status_dt).total_seconds() / 3600.0
+            if status_age_h >= 1.0:
+                mae_pct = ((entry - mae) / entry * 100.0) if (entry > 0 and mae > 0) else 0.0
+                msgs.append(build_message("📊", "HOURLY STATUS", symbol, entry, peak, current,
+                                          f"Holding {mult:.2f}x | MAE -{mae_pct:.0f}%", pair))
+                last_status_dt = now
 
     conn.execute(
-        "UPDATE tp_state SET entry_mcap=?, peak_mcap=?, last_peak_ts=?, started_ts=?, tp1=?, tp2=?, tp3=?, tp4=?, "
-        "closed=?, close_reason=?, last_status_ts=?, exit_mcap=?, closed_ts=?, entry_status=?, limit_mcap=? "
+        "UPDATE tp_state SET entry_mcap=?, peak_mcap=?, last_peak_ts=?, tp1=?, tp2=?, tp3=?, tp4=?, "
+        "closed=?, close_reason=?, last_status_ts=?, exit_mcap=?, closed_ts=?, mae_mcap=? "
         "WHERE token_address=?",
-        (entry, peak, last_peak_dt.isoformat(), started_dt.isoformat(), tp1, tp2, tp3, tp4,
-         closed, reason, last_status_dt.isoformat(), exit_mcap, closed_ts, entry_status, limit_mcap, token),
+        (entry, peak, last_peak_dt.isoformat(), tp1, tp2, tp3, tp4,
+         closed, reason, last_status_dt.isoformat(), exit_mcap, closed_ts, mae, token),
     )
     conn.commit()
     return send_all(msgs)
 
 
 def main() -> None:
-    log("💼 Cloud Take-Profit Tracker v5 (Phase 7) starting...")
+    log("💼 Exit Engine v7.1 (flat -25% peak trail) starting...")
     if not os.path.exists(DB_PATH):
         log("⚠️ DB not found yet. Exiting safely.")
         return
@@ -360,22 +313,21 @@ def main() -> None:
 
     seeded = seed_new_positions(conn)
     if seeded:
-        log(f"🌱 Seeded {seeded} pending limit entr(ies).")
+        log(f"🌱 Seeded {seeded} new position(s).")
 
     rows = conn.execute(
         "SELECT token_address, symbol, pair_address, entry_mcap, peak_mcap, last_peak_ts, started_ts, "
-        "tp1, tp2, tp3, tp4, last_status_ts, entry_status, limit_mcap, entry_deadline, size_mult "
-        "FROM tp_state WHERE closed = 0"
+        "tp1, tp2, tp3, tp4, last_status_ts, mae_mcap FROM tp_state WHERE closed = 0"
     ).fetchall()
     if not rows:
         log("🔍 No open positions. Sleeping.")
         conn.close()
         return
 
-    log(f"📡 Watching {len(rows)} position(s) (pending + active)...")
+    log(f"📡 Watching {len(rows)} open position(s)...")
     ok, mcap_map = fetch_mcaps([r[0] for r in rows])
     if not ok:
-        log("⚠️ DexScreener fetch failed - skipping cycle.")
+        log("⚠️ DexScreener fetch failed - skipping cycle, positions untouched.")
         conn.close()
         return
 
@@ -384,7 +336,7 @@ def main() -> None:
     for r in rows:
         sent += evaluate_position(conn, r, now, mcap_map)
     conn.close()
-    log(f"✅ TP Tracker complete. {sent} Telegram alert(s) fired.")
+    log(f"✅ Exit engine complete. {sent} Telegram alert(s) fired.")
 
 
 if __name__ == "__main__":
