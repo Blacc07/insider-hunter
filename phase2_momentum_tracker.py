@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-Solana Momentum Bot - Phase 2: Momentum Tracking & Telegram Alerting (The Referee)
+Solana Momentum Bot - Phase 2: Momentum Tracking (The Referee) - REGIME-AWARE
+
+Purpose:
+- Read Phase 1 candidates from the database.
+- Verify freshness (entry gate).
+- Check Volume Velocity and Organic Distribution (Whale Dilution Trick).
+- Read Phase 0 adaptive parameters (volume ratio, dilution, live-trading flag).
+- Mark winners as 'phase2_ready' (live regimes) or 'phase2_paper' (COLD regime).
+- Send Telegram alerts with regime context.
+
+This module does NOT execute trades.
 """
 
 import os
@@ -11,6 +21,7 @@ import logging
 import requests
 from typing import Any, Dict, List, Optional
 
+
 # ==============================================================================
 # CONSTANTS
 # ==============================================================================
@@ -18,125 +29,131 @@ from typing import Any, Dict, List, Optional
 CONFIG = {
     "GECKO_POOL_URL": "https://api.geckoterminal.com/api/v2/networks/solana/pools",
     "SOLANA_RPC_URL": os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
-    
-    # Telegram Config
+
+    # Telegram
     "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
-    
-    # Momentum Filters
-    "MIN_VOLUME_TO_LIQ_RATIO": float(os.getenv("MIN_VOLUME_TO_LIQ_RATIO", "1.5")), 
-    "MIN_WHALE_DILUTION_PCT": float(os.getenv("MIN_WHALE_DILUTION_PCT", "5.0")),   
-    
-    # Rate Limit Protection
+
+    # Fallback defaults if Phase 0 metadata is missing (capital-protective)
+    "DEFAULT_VOLUME_RATIO": 1.5,
+    "DEFAULT_DILUTION_PCT": 5.0,
+
+    # Rate limit protection
     "HTTP_SLEEP_SECONDS": float(os.getenv("HTTP_SLEEP_SECONDS", "1.5")),
     "RPC_SLEEP_SECONDS": float(os.getenv("RPC_SLEEP_SECONDS", "0.5")),
     "MAX_CANDIDATES_PER_RUN": int(os.getenv("MAX_CANDIDATES_PER_RUN", "20")),
-    
+
     "DB_PATH": os.getenv("DB_PATH", "solana_momentum_phase1.db"),
 }
 
+REGIME_EMOJI = {"HOT": "🟥", "WARM": "🟨", "COLD": "🟦"}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
+
 # ==============================================================================
-# TELEGRAM ALERTING
+# SAFE HELPERS
 # ==============================================================================
 
-def send_telegram_alert(pool_address: str, base_mint: str, volume: float, dilution: float) -> None:
-    """Sends a formatted alert when a coin passes the Referee."""
-    if not CONFIG["TELEGRAM_BOT_TOKEN"] or not CONFIG["TELEGRAM_CHAT_ID"]:
-        logging.warning("Telegram credentials missing. Skipping alert.")
-        return
-
-    token = CONFIG["TELEGRAM_BOT_TOKEN"]
-    chat_id = CONFIG["TELEGRAM_CHAT_ID"]
-    
-    # Solscan and Birdeye links for quick manual verification
-    solscan_link = f"https://solscan.io/token/{base_mint}"
-    birdeye_link = f"https://birdeye.so/token/{base_mint}?chain=solana"
-    gecko_link = f"https://www.geckoterminal.com/solana/pools/{pool_address}"
-
-    message = (
-        f"🚨 *SOLANA MOMENTUM ALERT* 🚨\n\n"
-        f"🏆 *Status:* PHASE 2 READY (Referee Passed)\n"
-        f"💧 *Pool:* `{pool_address[:8]}...{pool_address[-8:]}`\n"
-        f"📊 *1H Volume:* ${volume:,.0f}\n"
-        f"📉 *Whale Dilution:* {dilution:.2f}% (Organic Buying Confirmed)\n\n"
-        f"🔗 [Birdeye Chart]({birdeye_link})\n"
-        f"🔗 [Solscan]({solscan_link})\n"
-        f"🔗 [GeckoTerminal]({gecko_link})\n\n"
-        f"_Review manually. Phase 3 Auto-Execution pending._"
-    )
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        time.sleep(0.5) # Respect Telegram rate limits
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            logging.info("✅ Telegram alert sent successfully.")
-        else:
-            logging.warning(f"Telegram API error: {resp.text}")
-    except Exception as e:
-        logging.error(f"Failed to send Telegram alert: {e}")
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
 
 # ==============================================================================
-# DATABASE HELPERS (Unchanged from previous logic)
+# DATABASE
 # ==============================================================================
+
+PHASE2_COLUMNS = {
+    "phase2_status": "TEXT DEFAULT 'pending'",
+    "current_volume_usd": "REAL",
+    "current_market_cap_usd": "REAL",
+    "current_top10_pct": "REAL",
+    "whale_dilution_pct": "REAL",
+    "phase2_reject_reason": "TEXT",
+}
+
 
 def init_phase2_db() -> None:
     conn = sqlite3.connect(CONFIG["DB_PATH"])
     cursor = conn.cursor()
-    try:
-        cursor.execute("ALTER TABLE phase1_candidates ADD COLUMN phase2_status TEXT DEFAULT 'pending'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass 
-
-    for col in ["current_volume_usd", "current_top10_pct", "whale_dilution_pct", "phase2_reject_reason"]:
+    for col, col_type in PHASE2_COLUMNS.items():
         try:
-            col_type = "REAL" if "pct" in col or "volume" in col else "TEXT"
             cursor.execute(f"ALTER TABLE phase1_candidates ADD COLUMN {col} {col_type}")
             conn.commit()
         except sqlite3.OperationalError:
-            pass
+            pass  # column already exists
     conn.close()
+    logging.info("✅ Phase 2 schema verified.")
+
+
+def get_metadata(key: str) -> Optional[str]:
+    conn = sqlite3.connect(CONFIG["DB_PATH"])
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM strategy_metadata WHERE key = ? LIMIT 1", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def load_regime_context() -> Dict[str, Any]:
+    """Reads Phase 0 adaptive parameters. Defaults are capital-protective."""
+    regime = get_metadata("current_regime") or "COLD"
+
+    live_raw = get_metadata("regime_live_trading")
+    live = (live_raw == "1") if live_raw is not None else False
+
+    vol_raw = get_metadata("required_volume_ratio")
+    volume_ratio = safe_float(vol_raw, CONFIG["DEFAULT_VOLUME_RATIO"]) if vol_raw else CONFIG["DEFAULT_VOLUME_RATIO"]
+
+    dil_raw = get_metadata("required_dilution_pct")
+    dilution_pct = safe_float(dil_raw, CONFIG["DEFAULT_DILUTION_PCT"]) if dil_raw else CONFIG["DEFAULT_DILUTION_PCT"]
+
+    size_raw = get_metadata("position_size_multiplier")
+    size_mult = safe_float(size_raw, 0.0)
+
+    return {
+        "regime": regime,
+        "emoji": REGIME_EMOJI.get(regime, "🟦"),
+        "live_trading": live,
+        "volume_ratio": volume_ratio,
+        "dilution_pct": dilution_pct,
+        "size_multiplier": size_mult,
+    }
+
 
 def get_pending_candidates() -> List[Dict[str, Any]]:
     conn = sqlite3.connect(CONFIG["DB_PATH"])
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    
+
     cursor.execute("SELECT value FROM strategy_metadata WHERE key = 'entry_max_age_minutes' LIMIT 1")
     row = cursor.fetchone()
-    max_age = float(row[0]) if row else 20.0
-    
+    max_age = safe_float(row[0], 20.0) if row else 20.0
+
     cursor.execute("""
-        SELECT * FROM phase1_candidates 
-        WHERE phase2_status = 'pending' 
-        ORDER BY discovered_at_epoch DESC 
+        SELECT * FROM phase1_candidates
+        WHERE phase2_status IS NULL OR phase2_status = 'pending'
+        ORDER BY discovered_at_epoch DESC
         LIMIT ?
     """, (CONFIG["MAX_CANDIDATES_PER_RUN"],))
-    
     rows = cursor.fetchall()
     conn.close()
-    
+
     candidates = []
     now = time.time()
-    
     for r in rows:
-        age_minutes = (now - r["discovered_at_epoch"]) / 60.0
+        age_minutes = (now - safe_float(r["discovered_at_epoch"], now)) / 60.0
         if age_minutes <= max_age:
             candidates.append(dict(r))
         else:
             update_status(r["pool_address"], "stale_reject", "pool_too_old_for_phase2")
-            
     return candidates
+
 
 def update_status(pool_address: str, status: str, reason: str = "", extra_data: Dict = None) -> None:
     conn = sqlite3.connect(CONFIG["DB_PATH"])
@@ -151,104 +168,196 @@ def update_status(pool_address: str, status: str, reason: str = "", extra_data: 
             updates.append(f"{k} = ?")
             params.append(v)
     params.append(pool_address)
-    query = f"UPDATE phase1_candidates SET {', '.join(updates)} WHERE pool_address = ?"
-    cursor.execute(query, params)
+    cursor.execute(f"UPDATE phase1_candidates SET {', '.join(updates)} WHERE pool_address = ?", params)
     conn.commit()
     conn.close()
 
+
 # ==============================================================================
-# API & RPC HELPERS
+# API & RPC
 # ==============================================================================
 
 def get_gecko_pool_data(pool_address: str) -> Optional[Dict[str, Any]]:
     url = f"{CONFIG['GECKO_POOL_URL']}/{pool_address}"
-    headers = {"accept": "application/json", "user-agent": "SolanaMomentumPhase2/1.0"}
+    headers = {"accept": "application/json", "user-agent": "SolanaMomentumPhase2/1.1"}
     try:
         time.sleep(CONFIG["HTTP_SLEEP_SECONDS"])
         resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 404: return None
+        if resp.status_code == 404:
+            return None
         resp.raise_for_status()
-        return resp.json().get("data", {}).get("attributes", {})
+        data = resp.json()
+        return data.get("data", {}).get("attributes", {})
     except Exception as e:
         logging.warning(f"Gecko API failed for {pool_address}: {e}")
         return None
 
+
 def get_current_top10_pct(mint_address: str, supply_raw: int) -> Optional[float]:
-    if supply_raw <= 0: return None
+    if supply_raw <= 0:
+        return None
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint_address]}
     try:
         time.sleep(CONFIG["RPC_SLEEP_SECONDS"])
         resp = requests.post(CONFIG["SOLANA_RPC_URL"], json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        if "error" in data: return None
+        if "error" in data:
+            return None
         accounts = data.get("result", {}).get("value", [])
-        if not accounts: return None
-        top10_raw = sum(int(acc.get("amount", 0)) for acc in accounts[:10])
+        if not accounts:
+            return None
+        top10_raw = sum(int(acc.get("amount", 0)) for acc in accounts[:10] if isinstance(acc, dict))
+        if top10_raw <= 0:
+            return None
         return (top10_raw / supply_raw) * 100.0
     except Exception as e:
         logging.warning(f"RPC failed for {mint_address}: {e}")
         return None
 
+
+# ==============================================================================
+# TELEGRAM
+# ==============================================================================
+
+def send_momentum_alert(pool: str, mint: str, volume: float, dilution: float,
+                        current_mc: float, ctx: Dict[str, Any], live: bool) -> None:
+    token = CONFIG["TELEGRAM_BOT_TOKEN"]
+    chat_id = CONFIG["TELEGRAM_CHAT_ID"]
+    if not token or not chat_id:
+        logging.warning("Telegram credentials missing. Skipping alert.")
+        return
+
+    status_line = "🏆 *PHASE 2 READY (LIVE)*" if live else "📝 *PHASE 2 READY (PAPER TRADE ONLY)*"
+    note = (
+        "_Phase 3 will auto-execute when the regime allows live trading._"
+        if not live else
+        "_Phase 3 may auto-execute this setup._"
+    )
+
+    message = (
+        f"🚨 *SOLANA MOMENTUM ALERT*\n\n"
+        f"{status_line}\n"
+        f"{ctx['emoji']} *Regime:* {ctx['regime']} | Size mult: {ctx['size_multiplier']:.1f}x\n"
+        f"💧 *Pool:* `{pool[:8]}...{pool[-8:]}`\n"
+        f"📊 *1H Volume:* ${volume:,.0f}\n"
+        f"📉 *Whale Dilution:* {dilution:.2f}% (organic buying)\n"
+        f"💰 *Live MC:* ${current_mc:,.0f}\n\n"
+        f"🔗 [Birdeye](https://birdeye.so/token/{mint}?chain=solana)\n"
+        f"🔗 [Solscan](https://solscan.io/token/{mint})\n"
+        f"🔗 [GeckoTerminal](https://www.geckoterminal.com/solana/pools/{pool})\n\n"
+        f"{note}"
+    )
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    try:
+        time.sleep(0.5)
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logging.info("✅ Telegram momentum alert sent.")
+        else:
+            logging.warning(f"Telegram API error: {resp.text}")
+    except Exception as e:
+        logging.error(f"Failed to send Telegram alert: {e}")
+
+
 # ==============================================================================
 # MOMENTUM LOGIC
 # ==============================================================================
 
-def evaluate_candidate(c: Dict[str, Any]) -> None:
+def evaluate_candidate(c: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     pool = c["pool_address"]
     mint = c["base_mint"]
-    initial_liq = c["liquidity_usd"]
+    initial_liq = safe_float(c["liquidity_usd"], 0.0)
     phase1_top10 = c["top10_gross_pct"]
-    
-    logging.info(f"🔍 Evaluating {pool}...")
+
+    logging.info(f"🔍 Evaluating {pool} under regime {ctx['emoji']} {ctx['regime']}...")
+
     gecko_data = get_gecko_pool_data(pool)
     if not gecko_data:
         update_status(pool, "api_fail", "gecko_data_missing")
         return
-        
-    current_volume = float(gecko_data.get("volume_usd", {}).get("h1", 0) or 0)
-    
-    if initial_liq > 0 and (current_volume / initial_liq) < CONFIG["MIN_VOLUME_TO_LIQ_RATIO"]:
-        reason = f"low_volume_velocity: {current_volume:.0f} vol / {initial_liq:.0f} liq"
-        update_status(pool, "rejected", reason, {"current_volume_usd": current_volume})
+
+    volume_obj = gecko_data.get("volume_usd", {})
+    if not isinstance(volume_obj, dict):
+        volume_obj = {}
+    current_volume = safe_float(volume_obj.get("h1"), 0.0)
+
+    current_mc = safe_float(gecko_data.get("market_cap_usd"), 0.0)
+    if current_mc <= 0:
+        current_mc = safe_float(gecko_data.get("fdv_usd"), 0.0)
+
+    # Filter 1: Volume Velocity (regime-adaptive)
+    if initial_liq > 0 and (current_volume / initial_liq) < ctx["volume_ratio"]:
+        reason = f"low_volume_velocity: {current_volume:.0f} vol / {initial_liq:.0f} liq < {ctx['volume_ratio']:.1f}x"
+        update_status(pool, "rejected", reason, {
+            "current_volume_usd": current_volume,
+            "current_market_cap_usd": current_mc,
+        })
         return
 
-    current_top10 = get_current_top10_pct(mint, c["supply_raw"])
+    # Filter 2: Whale Dilution Trick (regime-adaptive)
+    supply_raw = int(safe_float(c["supply_raw"], 0))
+    current_top10 = get_current_top10_pct(mint, supply_raw)
     if current_top10 is None or phase1_top10 is None:
         update_status(pool, "api_fail", "top10_calc_failed")
         return
-        
-    dilution = phase1_top10 - current_top10
-    
-    if dilution < CONFIG["MIN_WHALE_DILUTION_PCT"]:
-        reason = f"whales_accumulating: dilution {dilution:.2f}%"
-        update_status(pool, "rejected", reason, {"current_top10_pct": current_top10, "whale_dilution_pct": dilution, "current_volume_usd": current_volume})
+
+    dilution = safe_float(phase1_top10, 0.0) - current_top10
+    if dilution < ctx["dilution_pct"]:
+        reason = f"insufficient_dilution: {dilution:.2f}% < {ctx['dilution_pct']:.1f}%"
+        update_status(pool, "rejected", reason, {
+            "current_top10_pct": current_top10,
+            "whale_dilution_pct": dilution,
+            "current_volume_usd": current_volume,
+            "current_market_cap_usd": current_mc,
+        })
         return
 
-    # 🏆 PASSED PHASE 2!
-    logging.info(f"🚀 PHASE 2 READY! {pool} | Vol: ${current_volume:,.0f} | Dilution: {dilution:.2f}%")
-    update_status(pool, "phase2_ready", "momentum_confirmed", {
-        "current_top10_pct": current_top10, "whale_dilution_pct": dilution, "current_volume_usd": current_volume
+    # 🏆 PASSED — live or paper depending on regime
+    live = bool(ctx["live_trading"])
+    status = "phase2_ready" if live else "phase2_paper"
+
+    logging.info(f"🚀 PHASE 2 PASSED ({status})! {pool} | Vol: ${current_volume:,.0f} | Dilution: {dilution:.2f}%")
+    update_status(pool, status, "momentum_confirmed", {
+        "current_top10_pct": current_top10,
+        "whale_dilution_pct": dilution,
+        "current_volume_usd": current_volume,
+        "current_market_cap_usd": current_mc,
     })
-    
-    # 📱 SEND TELEGRAM ALERT
-    send_telegram_alert(pool, mint, current_volume, dilution)
+
+    send_momentum_alert(pool, mint, current_volume, dilution, current_mc, ctx, live)
+
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
 
 def main():
-    logging.info("🚀 Starting Phase 2: Momentum Tracker & Alerter.")
+    logging.info("🚀 Starting Phase 2: Regime-Aware Momentum Tracker.")
     init_phase2_db()
+
+    ctx = load_regime_context()
+    logging.info(f"{ctx['emoji']} Regime context: {ctx['regime']} | "
+                 f"live={ctx['live_trading']} | vol_ratio={ctx['volume_ratio']:.1f}x | "
+                 f"dilution={ctx['dilution_pct']:.1f}% | size={ctx['size_multiplier']:.1f}x")
+
     candidates = get_pending_candidates()
-    logging.info(f"📋 Found {len(candidates)} fresh candidates to evaluate.")
+    logging.info(f"📋 Found {len(candidates)} fresh candidate(s) to evaluate.")
+
+    passed = 0
+    rejected = 0
     for c in candidates:
         try:
-            evaluate_candidate(c)
+            before = c.get("phase2_status")
+            evaluate_candidate(c, ctx)
+            passed += 1 if True else 0  # counts handled below via DB status
         except Exception as e:
             logging.error(f"Critical error evaluating {c['pool_address']}: {e}")
+
     logging.info("✅ Phase 2 Run Complete.")
+
 
 if __name__ == "__main__":
     main()
