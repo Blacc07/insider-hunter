@@ -1,8 +1,8 @@
 name: Solana Momentum Phase 1
 
 on:
-  workflow_dispatch: {}          # <-- your external cron-job hits this
-  schedule:                      # fallback only (free tier may delay it)
+  workflow_dispatch: {}
+  schedule:
     - cron: "*/5 * * * *"
 
 permissions:
@@ -28,9 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Phase 1 discovery
+      - name: Run Phase 1 + Phase 0 Regime Engine
         env:
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python phase1_discovery_filter.py
 
       - name: Persist state (commit DB back to repo)
