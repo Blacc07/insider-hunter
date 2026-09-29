@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Solana Momentum Bot - Phase 2: Momentum Tracking (The Referee) - REGIME-AWARE v2.1
+Solana Momentum Bot - Phase 2: Momentum Tracking (The Referee) - REGIME-AWARE v2.2
 
-v2.1 changes:
+v2.2 changes:
+- Telegram messages now use HTML parse mode with escaped dynamic values.
+  (Fixes 400 error: "can't parse entities" caused by underscores in DB reasons.)
+
+v2.1 features (unchanged):
 - Logs EVERY rejection / api_fail for full run transparency.
 - Sends a once-per-day Telegram Referee Digest (proof-of-life in COLD regimes).
 - Instant Telegram alerts on passes (LIVE or PAPER).
@@ -12,6 +16,7 @@ This module does NOT execute trades.
 """
 
 import os
+import html
 import time
 import sqlite3
 import logging
@@ -192,7 +197,7 @@ def update_status(pool_address: str, status: str, reason: str = "", extra_data: 
 
 def get_gecko_pool_data(pool_address: str) -> Optional[Dict[str, Any]]:
     url = f"{CONFIG['GECKO_POOL_URL']}/{pool_address}"
-    headers = {"accept": "application/json", "user-agent": "SolanaMomentumPhase2/2.1"}
+    headers = {"accept": "application/json", "user-agent": "SolanaMomentumPhase2/2.2"}
     try:
         time.sleep(CONFIG["HTTP_SLEEP_SECONDS"])
         resp = requests.get(url, headers=headers, timeout=15)
@@ -230,7 +235,7 @@ def get_current_top10_pct(mint_address: str, supply_raw: int) -> Optional[float]
 
 
 # ==============================================================================
-# TELEGRAM
+# TELEGRAM (HTML-SAFE v2.2)
 # ==============================================================================
 
 def send_telegram(message: str) -> bool:
@@ -241,7 +246,12 @@ def send_telegram(message: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",   # HTML mode: underscores/symbols in data can't break parsing
+        "disable_web_page_preview": True,
+    }
     try:
         time.sleep(0.5)
         resp = requests.post(url, json=payload, timeout=10)
@@ -256,22 +266,27 @@ def send_telegram(message: str) -> bool:
 
 def send_momentum_alert(pool: str, mint: str, volume: float, dilution: float,
                         current_mc: float, ctx: Dict[str, Any], live: bool) -> None:
-    status_line = "🏆 *PHASE 2 READY (LIVE)*" if live else "📝 *PHASE 2 READY (PAPER TRADE ONLY)*"
-    note = ("_Phase 3 will auto-execute when the regime allows live trading._"
-            if not live else "_Phase 3 may auto-execute this setup._")
+    status_line = "🏆 <b>PHASE 2 READY (LIVE)</b>" if live else "📝 <b>PHASE 2 READY (PAPER TRADE ONLY)</b>"
+    note = ("Phase 3 will auto-execute when the regime allows live trading."
+            if not live else "Phase 3 may auto-execute this setup.")
+
+    birdeye = f"https://birdeye.so/token/{mint}?chain=solana"
+    solscan = f"https://solscan.io/token/{mint}"
+    gecko = f"https://www.geckoterminal.com/solana/pools/{pool}"
 
     message = (
-        f"🚨 *SOLANA MOMENTUM ALERT*\n\n"
+        f"🚨 <b>SOLANA MOMENTUM ALERT</b>\n\n"
         f"{status_line}\n"
-        f"{ctx['emoji']} *Regime:* {ctx['regime']} | Size mult: {ctx['size_multiplier']:.1f}x\n"
-        f"💧 *Pool:* `{pool[:8]}...{pool[-8:]}`\n"
-        f"📊 *1H Volume:* ${volume:,.0f}\n"
-        f"📉 *Whale Dilution:* {dilution:.2f}% (organic buying)\n"
-        f"💰 *Live MC:* ${current_mc:,.0f}\n\n"
-        f"🔗 [Birdeye](https://birdeye.so/token/{mint}?chain=solana)\n"
-        f"🔗 [Solscan](https://solscan.io/token/{mint})\n"
-        f"🔗 [GeckoTerminal](https://www.geckoterminal.com/solana/pools/{pool})\n\n"
-        f"{note}"
+        f"{ctx['emoji']} <b>Regime:</b> {html.escape(ctx['regime'])} | "
+        f"Size mult: {ctx['size_multiplier']:.1f}x\n"
+        f"💧 <b>Pool:</b> <code>{html.escape(pool[:8])}...{html.escape(pool[-8:])}</code>\n"
+        f"📊 <b>1H Volume:</b> ${volume:,.0f}\n"
+        f"📉 <b>Whale Dilution:</b> {dilution:.2f}% (organic buying)\n"
+        f"💰 <b>Live MC:</b> ${current_mc:,.0f}\n\n"
+        f'🔗 <a href="{birdeye}">Birdeye</a>\n'
+        f'🔗 <a href="{solscan}">Solscan</a>\n'
+        f'🔗 <a href="{gecko}">GeckoTerminal</a>\n\n'
+        f"<i>{html.escape(note)}</i>"
     )
     if send_telegram(message):
         logging.info("✅ Telegram momentum alert sent.")
@@ -279,14 +294,16 @@ def send_momentum_alert(pool: str, mint: str, volume: float, dilution: float,
 
 def send_daily_digest(counters: Dict[str, int], reasons: Dict[str, int], ctx: Dict[str, Any]) -> None:
     top = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:3]
-    reason_lines = "\n".join([f"• {name}: {n}" for name, n in top]) or "• none"
+    reason_lines = "\n".join([f"• {html.escape(name)}: {n}" for name, n in top]) or "• none"
 
     message = (
-        f"📋 *REFEREE DAILY DIGEST*\n\n"
-        f"{ctx['emoji']} *Regime:* {ctx['regime']} | live={ctx['live_trading']}\n"
-        f"🔎 Evaluated: {counters['evaluated']} | ✅ Passed: {counters['passed']} | ❌ Rejected: {counters['rejected']}\n\n"
-        f"*Top rejection reasons:*\n{reason_lines}\n\n"
-        f"_Instant alerts fire on any pass. Next digest in 24h._"
+        f"📋 <b>REFEREE DAILY DIGEST</b>\n\n"
+        f"{ctx['emoji']} <b>Regime:</b> {html.escape(ctx['regime'])} | "
+        f"live={str(ctx['live_trading'])}\n"
+        f"🔎 Evaluated: {counters['evaluated']} | ✅ Passed: {counters['passed']} | "
+        f"❌ Rejected: {counters['rejected']}\n\n"
+        f"<b>Top rejection reasons:</b>\n{reason_lines}\n\n"
+        f"<i>Instant alerts fire on any pass. Next digest in 24h.</i>"
     )
 
     if send_telegram(message):
@@ -371,7 +388,7 @@ def evaluate_candidate(c: Dict[str, Any], ctx: Dict[str, Any]) -> str:
 # ==============================================================================
 
 def main():
-    logging.info("🚀 Starting Phase 2 v2.1: Regime-Aware Momentum Tracker.")
+    logging.info("🚀 Starting Phase 2 v2.2: Regime-Aware Momentum Tracker (HTML-safe Telegram).")
     init_phase2_db()
 
     ctx = load_regime_context()
@@ -393,9 +410,6 @@ def main():
                 counters["passed"] += 1
             elif result == "rejected":
                 counters["rejected"] += 1
-                raw = c.get("phase2_reject_reason") or ""
-                key = reason_prefix(raw) if raw else "low_volume_velocity"
-                reasons[key] = reasons.get(key, 0) + 1
             else:
                 counters["api_fail"] += 1
         except Exception as e:
@@ -413,7 +427,7 @@ def main():
         reasons[key] = reasons.get(key, 0) + 1
     conn.close()
 
-    # Daily digest (proof-of-life)
+    # Daily digest (proof-of-life) — retries automatically until it succeeds
     last_raw = get_metadata("last_phase2_digest_epoch")
     last = safe_float(last_raw, 0.0)
     if (time.time() - last) >= CONFIG["DIGEST_INTERVAL_SECONDS"]:
